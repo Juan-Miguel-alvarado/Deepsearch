@@ -16,6 +16,12 @@ deepsearch tui                   # interactive fuzzy search
 
 ---
 
+
+
+https://github.com/user-attachments/assets/0860a6b1-cf3e-4f9d-b826-25801c7f3596
+
+
+
 ## Architecture
 
 Three layers, with a hard boundary between the engine and the UI:
