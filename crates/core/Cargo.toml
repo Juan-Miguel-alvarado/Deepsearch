@@ -1,0 +1,35 @@
+[package]
+name = "deepsearch-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Indexing + BM25 search engine core for deepsearch (no TUI)."
+
+[lib]
+name = "deepsearch_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
+rust-stemmers = "1"
+ignore = "0.4"
+rayon = "1"
+anyhow = "1"
+thiserror = "2"
+dirs = "6"
+infer = "0.19"
+content_inspector = "0.2"
+pdf-extract = "0.9"
+zip = "2"
+quick-xml = "0.37"
+strsim = "0.11"
+
+[dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports"] }
+tempfile = "3"
+
+[[bench]]
+name = "bench"
+harness = false

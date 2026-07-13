@@ -1,0 +1,24 @@
+[package]
+name = "deepsearch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Relevance-ranked full-text search over all your files, with an interactive TUI."
+
+[[bin]]
+name = "deepsearch"
+path = "src/main.rs"
+
+[dependencies]
+deepsearch-core = { path = "../core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+ratatui = "0.30"
+crossterm = "0.29"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+# `chafa-dyn` (a default feature) needs the libchafa system library; drop it.
+# Native Kitty/Sixel/iTerm2 protocols + Unicode-halfblock fallback remain.
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
+image = "0.25"

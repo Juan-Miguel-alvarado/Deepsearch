@@ -1,0 +1,10 @@
+# Rust build artifacts
+/target
+**/target
+
+# Criterion benchmark output
+/criterion
+
+# Editor / OS junk
+*.swp
+.DS_Store
