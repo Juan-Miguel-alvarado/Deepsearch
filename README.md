@@ -12,7 +12,9 @@ An interactive TUI gives you incremental search — matching prefixes as you typ
 with `type:`/`ext:` filters — live, syntax-highlighted previews (and image
 previews via the terminal graphics protocol), an **open-with** menu that
 launches the selected file in whatever app you have installed (editor, image/PDF
-viewer, media player, or the OS default), and one-key **copy-path**.
+viewer, media player, or the OS default), one-key **copy-path**, and optional
+**natural-language search** via a local [Ollama](https://ollama.com) model
+(free, offline, no API keys).
 
 ```
 deepsearch index ~/projects      # scan & index once (incremental afterwards)
@@ -275,10 +277,34 @@ deepsearch index [PATH] --incremental
 deepsearch query "<words>"         Ranked results (name + content).
         --limit N                  Cap results (default 20).
         --json                     Machine-readable output.
+deepsearch ask "<plain text>"      Natural-language search (needs local Ollama).
 deepsearch tui [PATH]              Interactive UI (indexes PATH first if empty).
 deepsearch stats                   Index size, term counts, tombstone ratio.
         --cache <FILE>             Use a non-default index location (global flag).
 ```
+
+### Natural-language search (optional, local & free)
+
+If you have [Ollama](https://ollama.com) running locally, deepsearch can turn a
+plain-language request into a query for you — no API keys, no cloud, nothing
+leaves your machine (it talks to `localhost:11434`).
+
+```bash
+deepsearch ask "screenshots from my rust project"
+# → type:image rust
+#  1.  2.130  [image]  ~/rust/app/docs/demo.png
+#  ...
+```
+
+In the TUI, type what you're after and press **`Ctrl-a`**: a background thread
+asks the model, then replaces your query with the translated one and searches —
+the UI never blocks. The model rewrites the request into normal deepsearch
+syntax (keywords plus `type:`/`ext:` filters), which is then ranked as usual.
+
+It's entirely optional: with no Ollama installed, `ask` prints a friendly hint
+and everything else works exactly the same. deepsearch uses the first model
+Ollama has (or set `DEEPSEARCH_OLLAMA_MODEL=llama3.2`); point at a non-default
+server with `OLLAMA_HOST`.
 
 ### Search filters
 
@@ -311,6 +337,7 @@ deepsearch query "type:image"        # every image, most recent first
 | `i` or `/` | back to Insert mode |
 | `Enter` | **open** the file in the right app for its type (see below) |
 | `o` (Normal) / `Ctrl-o` | **open with…** — a clean, numbered menu of installed apps |
+| `Ctrl-a` | **ask AI** — rewrite the query in plain language (needs local Ollama) |
 | `y` (Normal) / `Ctrl-y` | **copy** the selected file's path to the clipboard |
 | `F1` (any mode) / `?` (Normal) | show a **help overlay** listing every key |
 | `Ctrl-U` | clear the query |

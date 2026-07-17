@@ -65,4 +65,5 @@ jobs:
             deepsearch-${{ matrix.target }}.zip
             deepsearch-${{ matrix.target }}.zip.sha256
           fail_on_unmatched_files: false
-          generate_release_notes: true
+          # Only one matrix job generates the notes, so they aren't duplicated.
+          generate_release_notes: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}

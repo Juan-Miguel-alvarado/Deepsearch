@@ -3,9 +3,11 @@
 //! Subcommands:
 //!   * `index [PATH]`   build (or `--incremental` update) the index.
 //!   * `query "<q>"`    one-shot ranked search (`--json` for scripts).
+//!   * `ask "<q>"`      natural-language search via a local Ollama model.
 //!   * `tui [PATH]`     interactive fuzzy search UI.
 //!   * `stats`          report on the current index.
 
+mod ai;
 mod clip;
 mod open;
 mod preview;
@@ -60,6 +62,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Ask in plain language; a local Ollama model turns it into a query.
+    Ask {
+        /// The natural-language request (all words joined).
+        #[arg(required = true)]
+        request: Vec<String>,
+        /// Maximum number of results.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit results as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Launch the interactive TUI.
     Tui {
         /// Root to index if the cache is empty (default: your home directory).
@@ -80,6 +94,11 @@ fn main() -> Result<()> {
         Some(Command::Query { query, limit, json }) => {
             cmd_query(cache, &query.join(" "), limit, json)
         }
+        Some(Command::Ask {
+            request,
+            limit,
+            json,
+        }) => cmd_ask(cache, &request.join(" "), limit, json),
         Some(Command::Tui { path }) => cmd_tui(cache, path),
         Some(Command::Stats) => cmd_stats(cache),
     }
@@ -150,6 +169,47 @@ fn cmd_query(cache: Option<&std::path::Path>, query: &str, limit: usize, json: b
     };
     let results = ds.search(query, &opts);
 
+    if json {
+        print_json(&results);
+    } else if results.is_empty() {
+        println!("No results for {query:?}.");
+    } else {
+        for (i, r) in results.iter().enumerate() {
+            println!(
+                "{:>2}. {:>7.3}  [{}]  {}",
+                i + 1,
+                r.score,
+                r.file_type.as_str(),
+                r.path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Natural-language search: a local Ollama model rewrites the request into a
+/// deepsearch query, which is then run through the normal ranker.
+fn cmd_ask(cache: Option<&std::path::Path>, request: &str, limit: usize, json: bool) -> Result<()> {
+    if !ai::available() {
+        anyhow::bail!(
+            "natural-language search needs a local Ollama server.\n\
+             Install it from https://ollama.com, run `ollama serve`, and pull a model \
+             (e.g. `ollama pull llama3.2`). deepsearch works without it — use `query` instead."
+        );
+    }
+    let ds = load_or_hint(cache)?;
+    let query = match ai::translate_query(request) {
+        Ok(q) => q,
+        Err(e) => anyhow::bail!("{e}"),
+    };
+    // Show what it understood (to stderr, so `--json` stdout stays clean).
+    eprintln!("→ {query}");
+
+    let opts = QueryOptions {
+        limit,
+        ..QueryOptions::default()
+    };
+    let results = ds.search(&query, &opts);
     if json {
         print_json(&results);
     } else if results.is_empty() {

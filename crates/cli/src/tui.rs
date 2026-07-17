@@ -10,6 +10,7 @@
 //!   * **Normal**: `j`/`k` (and arrows) move, `g`/`G` jump, `i` or `/` returns to
 //!     Insert, `q`/Esc quits, Enter opens the file.
 
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -89,6 +90,10 @@ pub struct App {
     open_menu: Option<OpenMenu>,
     show_help: bool,
 
+    /// In-flight natural-language translation (if any). `Some` means an "ask AI"
+    /// request is running on a background thread; the result arrives here.
+    ai_rx: Option<Receiver<Result<String, String>>>,
+
     dirty: bool,
     last_edit: Instant,
     status: String,
@@ -113,6 +118,7 @@ impl App {
             picker_tried: false,
             open_menu: None,
             show_help: false,
+            ai_rx: None,
             dirty: false,
             last_edit: Instant::now(),
             status: format!("{n} documents indexed — start typing to search"),
@@ -131,6 +137,7 @@ impl App {
         loop {
             terminal.draw(|f| self.render(f))?;
             self.drain_previews();
+            self.drain_ai();
 
             if event::poll(TICK)? {
                 if let Event::Key(key) = event::read()? {
@@ -196,6 +203,10 @@ impl App {
                 }
                 KeyCode::Char('y') => {
                     self.copy_path();
+                    return Action::None;
+                }
+                KeyCode::Char('a') => {
+                    self.ask_ai();
                     return Action::None;
                 }
                 _ => {}
@@ -311,6 +322,51 @@ impl App {
             Ok(tool) => format!("copied path to clipboard ({tool})"),
             Err(e) => format!("copy failed: {e}"),
         };
+    }
+
+    /// Send the current query to a local Ollama model to be rewritten as a
+    /// deepsearch query. Runs on a background thread so the UI never blocks; the
+    /// reply is picked up by [`Self::drain_ai`].
+    fn ask_ai(&mut self) {
+        if self.ai_rx.is_some() {
+            return; // a request is already in flight
+        }
+        let request = self.input.trim().to_string();
+        if request.is_empty() {
+            self.status = "type what you're looking for, then Ctrl-a".to_string();
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ai_rx = Some(rx);
+        self.status = "asking AI…".to_string();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::ai::translate_query(&request));
+        });
+    }
+
+    /// Apply a finished AI translation: replace the query and search, or report
+    /// the error.
+    fn drain_ai(&mut self) {
+        let Some(rx) = self.ai_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(query)) => {
+                self.ai_rx = None;
+                self.input = query;
+                self.status = format!("AI → {}", self.input);
+                self.mark_dirty();
+            }
+            Ok(Err(e)) => {
+                self.ai_rx = None;
+                self.status = format!("AI: {e}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {} // still working
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.ai_rx = None;
+                self.status = "AI request failed".to_string();
+            }
+        }
     }
 
     fn mark_dirty(&mut self) {
@@ -732,7 +788,7 @@ impl App {
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
-        let help = "↑/↓ move · Enter open · o open-with · y copy · F1 help · Esc/q quit";
+        let help = "↑/↓ move · Enter open · o open-with · Ctrl-a ask AI · F1 help · Esc/q quit";
         let line = Line::from(vec![
             Span::styled(
                 format!(" {} ", self.status),
@@ -766,6 +822,7 @@ fn render_help(frame: &mut Frame) {
         ("PageUp / PageDown", "move by 10"),
         ("Enter", "open in the right app for the file"),
         ("o  ·  Ctrl-o", "open-with menu (choose an app)"),
+        ("Ctrl-a", "ask in plain language (needs local Ollama)"),
         ("y  ·  Ctrl-y", "copy the file path to the clipboard"),
         ("Ctrl-u", "clear the query"),
         ("Esc", "Insert → Normal mode"),
