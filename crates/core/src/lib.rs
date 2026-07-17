@@ -102,11 +102,15 @@ impl DeepSearch {
     }
 
     /// Load an existing index from `path` (or the default cache path), falling
-    /// back to an empty index if none exists yet.
+    /// back to an empty index when none exists **or when the cache is from an
+    /// older format** — the caller then rebuilds, so a stale cache is a silent
+    /// no-op rather than an error.
     pub fn open_or_empty(path: Option<&Path>) -> Result<Self, DeepSearchError> {
         match Self::load(path) {
             Ok(ds) => Ok(ds),
-            Err(DeepSearchError::NotFound(_)) => Ok(Self::empty()),
+            Err(DeepSearchError::NotFound(_)) | Err(DeepSearchError::VersionMismatch { .. }) => {
+                Ok(Self::empty())
+            }
             Err(e) => Err(e),
         }
     }
@@ -120,15 +124,20 @@ impl DeepSearch {
             return Err(DeepSearchError::NotFound(path));
         }
         let bytes = std::fs::read(&path)?;
-        let (file, _): (IndexFile, usize) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                .map_err(|e| DeepSearchError::Codec(e.to_string()))?;
-        if file.version != FORMAT_VERSION {
+        let config = bincode::config::standard();
+        // Read just the version prefix first. The version is the first field of
+        // the envelope, so a stale cache produces a clear VersionMismatch instead
+        // of a confusing decode error when the Index layout has since changed.
+        let (version, _) = bincode::serde::decode_from_slice::<u32, _>(&bytes, config)
+            .map_err(|e| DeepSearchError::Codec(e.to_string()))?;
+        if version != FORMAT_VERSION {
             return Err(DeepSearchError::VersionMismatch {
-                found: file.version,
+                found: version,
                 expected: FORMAT_VERSION,
             });
         }
+        let (file, _): (IndexFile, usize) = bincode::serde::decode_from_slice(&bytes, config)
+            .map_err(|e| DeepSearchError::Codec(e.to_string()))?;
         Ok(DeepSearch { index: file.index })
     }
 
