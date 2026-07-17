@@ -93,6 +93,11 @@ pub struct App {
     /// In-flight natural-language translation (if any). `Some` means an "ask AI"
     /// request is running on a background thread; the result arrives here.
     ai_rx: Option<Receiver<Result<String, String>>>,
+    /// Whether a local Ollama server was detected (probed once at startup). When
+    /// true, the UI advertises the `Ctrl-a` "ask AI" shortcut.
+    ai_available: bool,
+    /// Receives the one-shot startup probe of Ollama availability.
+    ai_probe: Option<Receiver<bool>>,
 
     dirty: bool,
     last_edit: Instant,
@@ -102,6 +107,12 @@ pub struct App {
 impl App {
     pub fn new(ds: DeepSearch, opts: QueryOptions) -> Self {
         let n = ds.len();
+        // Probe Ollama once, off-thread, so startup never blocks on it. The
+        // result lights up the "ask AI" hint if a local server is reachable.
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = probe_tx.send(crate::ai::available());
+        });
         App {
             ds,
             opts,
@@ -119,6 +130,8 @@ impl App {
             open_menu: None,
             show_help: false,
             ai_rx: None,
+            ai_available: false,
+            ai_probe: Some(probe_rx),
             dirty: false,
             last_edit: Instant::now(),
             status: format!("{n} documents indexed — start typing to search"),
@@ -347,6 +360,14 @@ impl App {
     /// Apply a finished AI translation: replace the query and search, or report
     /// the error.
     fn drain_ai(&mut self) {
+        // Pick up the one-shot Ollama availability probe.
+        if let Some(probe) = self.ai_probe.as_ref() {
+            if let Ok(available) = probe.try_recv() {
+                self.ai_available = available;
+                self.ai_probe = None;
+            }
+        }
+
         let Some(rx) = self.ai_rx.as_ref() else {
             return;
         };
@@ -689,9 +710,29 @@ impl App {
                 Style::default().bg(Color::Blue).fg(Color::White),
             ),
         };
+        // Advertise the "ask AI" shortcut only when a local Ollama was found, so
+        // the feature is discoverable without cluttering the UI when it's off.
+        let ai_tag = if self.ai_rx.is_some() {
+            Some(Span::styled(
+                " ⌃A asking… ",
+                Style::default().bg(Color::Yellow).fg(Color::Black),
+            ))
+        } else if self.ai_available {
+            Some(Span::styled(
+                " ⌃A ask AI ",
+                Style::default().bg(Color::Magenta).fg(Color::White),
+            ))
+        } else {
+            None
+        };
+        let mut title = vec![Span::raw(" deepsearch "), mode_tag];
+        if let Some(tag) = ai_tag {
+            title.push(Span::raw(" "));
+            title.push(tag);
+        }
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(Line::from(vec![Span::raw(" deepsearch "), mode_tag]));
+            .title(Line::from(title));
         let text = Line::from(vec![
             Span::styled(
                 "❯ ",
