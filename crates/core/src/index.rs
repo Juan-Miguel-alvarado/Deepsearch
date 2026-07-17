@@ -186,7 +186,9 @@ impl Index {
             {
                 let new_id = fresh.docs.len() as u32;
                 remap.insert(meta.id, new_id);
-                fresh.path_to_id.insert(meta.path.clone(), (new_id, meta.mtime));
+                fresh
+                    .path_to_id
+                    .insert(meta.path.clone(), (new_id, meta.mtime));
                 let mut m = meta.clone();
                 m.id = new_id;
                 fresh.total_content_len += m.content_len as u64;
@@ -215,7 +217,12 @@ fn remap_postings(
     for (term, postings) in index {
         let mut kept: Vec<Posting> = postings
             .iter()
-            .filter_map(|p| remap.get(&p.doc_id).map(|&new_id| Posting { doc_id: new_id, tf: p.tf }))
+            .filter_map(|p| {
+                remap.get(&p.doc_id).map(|&new_id| Posting {
+                    doc_id: new_id,
+                    tf: p.tf,
+                })
+            })
             .collect();
         if !kept.is_empty() {
             kept.shrink_to_fit();

@@ -21,7 +21,10 @@ const WORDS_PER_DOC: usize = 60;
 struct Lcg(u64);
 impl Lcg {
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0 >> 16
     }
 }
@@ -35,7 +38,11 @@ fn word(i: usize) -> String {
     let len = 5 + (i % 3);
     for k in 0..len {
         x = x.wrapping_mul(48271).wrapping_add(1);
-        let c = if k % 2 == 0 { C[(x as usize) % C.len()] } else { V[(x as usize) % V.len()] };
+        let c = if k % 2 == 0 {
+            C[(x as usize) % C.len()]
+        } else {
+            V[(x as usize) % V.len()]
+        };
         s.push(c as char);
     }
     s
@@ -69,7 +76,11 @@ fn main() {
             name_raw: vec![a.clone(), b.clone()],
         });
     }
-    println!("  built in {:.2}s, {} content terms", t0.elapsed().as_secs_f64(), idx.content_index.len());
+    println!(
+        "  built in {:.2}s, {} content terms",
+        t0.elapsed().as_secs_f64(),
+        idx.content_index.len()
+    );
 
     let opts = QueryOptions::default();
     let bench = |label: &str, q: &str| {

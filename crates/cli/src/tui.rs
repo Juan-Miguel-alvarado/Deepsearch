@@ -17,7 +17,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use ratatui_image::picker::Picker;
@@ -26,6 +26,7 @@ use ratatui_image::StatefulImage;
 
 use deepsearch_core::{DeepSearch, QueryOptions, SearchResult};
 
+use crate::open::{candidates_for, AppKind, OpenApp};
 use crate::preview::{Preview, PreviewRequest, PreviewWorker};
 
 /// How long the query must be idle before we run the search.
@@ -42,7 +43,30 @@ enum Mode {
 enum Action {
     None,
     Quit,
-    OpenEditor,
+    SmartOpen,
+    OpenWith(OpenApp),
+}
+
+/// The "open with" popup: a list of installed apps for the selected file.
+struct OpenMenu {
+    apps: Vec<OpenApp>,
+    state: ListState,
+}
+
+impl OpenMenu {
+    fn move_selection(&mut self, delta: isize) {
+        if self.apps.is_empty() {
+            return;
+        }
+        let cur = self.state.selected().unwrap_or(0) as isize;
+        let max = self.apps.len() as isize - 1;
+        self.state
+            .select(Some((cur + delta).clamp(0, max) as usize));
+    }
+
+    fn selected(&self) -> Option<&OpenApp> {
+        self.state.selected().and_then(|i| self.apps.get(i))
+    }
 }
 
 pub struct App {
@@ -61,6 +85,9 @@ pub struct App {
     image_state: Option<StatefulProtocol>,
     picker: Option<Picker>,
     picker_tried: bool,
+
+    open_menu: Option<OpenMenu>,
+    show_help: bool,
 
     dirty: bool,
     last_edit: Instant,
@@ -84,6 +111,8 @@ impl App {
             image_state: None,
             picker: None,
             picker_tried: false,
+            open_menu: None,
+            show_help: false,
             dirty: false,
             last_edit: Instant::now(),
             status: format!("{n} documents indexed — start typing to search"),
@@ -110,7 +139,8 @@ impl App {
                     }
                     match self.handle_key(key.code, key.modifiers) {
                         Action::Quit => break,
-                        Action::OpenEditor => self.open_editor(terminal)?,
+                        Action::SmartOpen => self.smart_open(terminal)?,
+                        Action::OpenWith(app) => self.launch_app(terminal, app)?,
                         Action::None => {}
                     }
                 }
@@ -127,6 +157,22 @@ impl App {
     // --- input handling ---------------------------------------------------
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Action {
+        // Overlays capture keys while they are up.
+        if self.show_help {
+            // Any key dismisses the help overlay.
+            self.show_help = false;
+            return Action::None;
+        }
+        if self.open_menu.is_some() {
+            return self.handle_menu_key(code);
+        }
+
+        // F1 opens help from any mode (no need to leave Insert first).
+        if code == KeyCode::F(1) {
+            self.show_help = true;
+            return Action::None;
+        }
+
         // Global bindings first.
         if mods.contains(KeyModifiers::CONTROL) {
             match code {
@@ -144,6 +190,14 @@ impl App {
                     self.mark_dirty();
                     return Action::None;
                 }
+                KeyCode::Char('o') => {
+                    self.toggle_open_menu();
+                    return Action::None;
+                }
+                KeyCode::Char('y') => {
+                    self.copy_path();
+                    return Action::None;
+                }
                 _ => {}
             }
         }
@@ -155,7 +209,7 @@ impl App {
             KeyCode::PageUp => self.move_selection(-10),
             KeyCode::Enter => {
                 if self.selected().is_some() {
-                    return Action::OpenEditor;
+                    return Action::SmartOpen;
                 }
             }
             _ => match self.mode {
@@ -189,10 +243,74 @@ impl App {
             KeyCode::Char('g') => self.select(0),
             KeyCode::Char('G') => self.select(self.results.len().saturating_sub(1)),
             KeyCode::Char('i') | KeyCode::Char('/') => self.mode = Mode::Insert,
+            KeyCode::Char('o') => self.toggle_open_menu(),
+            KeyCode::Char('y') => self.copy_path(),
+            KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
             _ => {}
         }
         Action::None
+    }
+
+    /// Keys while the "open with" popup is up.
+    fn handle_menu_key(&mut self, code: KeyCode) -> Action {
+        let Some(menu) = self.open_menu.as_mut() else {
+            return Action::None;
+        };
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.open_menu = None,
+            KeyCode::Down | KeyCode::Char('j') => menu.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => menu.move_selection(-1),
+            KeyCode::Enter => {
+                let chosen = menu.selected().cloned();
+                self.open_menu = None;
+                if let Some(app) = chosen {
+                    return Action::OpenWith(app);
+                }
+            }
+            // Number keys jump straight to that entry and launch it.
+            KeyCode::Char(c @ '1'..='9') => {
+                let idx = c as usize - '1' as usize;
+                if let Some(app) = menu.apps.get(idx).cloned() {
+                    self.open_menu = None;
+                    return Action::OpenWith(app);
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Open (or close) the "open with" popup for the current selection.
+    fn toggle_open_menu(&mut self) {
+        if self.open_menu.is_some() {
+            self.open_menu = None;
+            return;
+        }
+        let Some((path, file_type)) = self.selected().map(|r| (r.path.clone(), r.file_type)) else {
+            self.status = "nothing selected to open".to_string();
+            return;
+        };
+        let apps = candidates_for(&path, file_type);
+        if apps.is_empty() {
+            self.status = "no applications found to open this file".to_string();
+            return;
+        }
+        let mut state = ListState::default();
+        state.select(Some(0));
+        self.open_menu = Some(OpenMenu { apps, state });
+    }
+
+    /// Copy the selected file's full path to the system clipboard.
+    fn copy_path(&mut self) {
+        let Some(path) = self.selected().map(|r| r.path.display().to_string()) else {
+            self.status = "nothing selected to copy".to_string();
+            return;
+        };
+        self.status = match crate::clip::copy(&path) {
+            Ok(tool) => format!("copied path to clipboard ({tool})"),
+            Err(e) => format!("copy failed: {e}"),
+        };
     }
 
     fn mark_dirty(&mut self) {
@@ -293,9 +411,7 @@ impl App {
                     }
                     None => {
                         self.showing_image = false;
-                        self.preview = Preview::Error(
-                            "terminal cannot render images".to_string(),
-                        );
+                        self.preview = Preview::Error("terminal cannot render images".to_string());
                     }
                 },
                 other => {
@@ -337,6 +453,70 @@ impl App {
         Ok(())
     }
 
+    /// Enter on a result: open it in the *right* app for its type — text/code in
+    /// `$EDITOR`, but images, PDFs, video and Office docs in a real viewer
+    /// instead of opening them as garbled text in the editor.
+    fn smart_open(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let Some((path, file_type)) = self.selected().map(|r| (r.path.clone(), r.file_type)) else {
+            return Ok(());
+        };
+        // Text and source belong in the editor.
+        if file_type.is_textual() {
+            return self.open_editor(terminal);
+        }
+        // Everything else: prefer a type-specific viewer / the OS default over a
+        // generic code editor; fall back to the editor only if nothing else is
+        // available.
+        let apps = candidates_for(&path, file_type);
+        let choice = apps
+            .iter()
+            .find(|a| {
+                !matches!(
+                    a.kind,
+                    AppKind::Editor | AppKind::Reveal | AppKind::Terminal
+                )
+            })
+            .or_else(|| apps.first())
+            .cloned();
+        match choice {
+            Some(app) => self.launch_app(terminal, app),
+            None => self.open_editor(terminal),
+        }
+    }
+
+    /// Launch a chosen [`OpenApp`]. The command (program + args, path included)
+    /// is ready to run. Terminal apps suspend the TUI for the duration; GUI apps
+    /// are spawned detached so the UI keeps running.
+    fn launch_app(&mut self, terminal: &mut DefaultTerminal, app: OpenApp) -> Result<()> {
+        if app.terminal {
+            ratatui::restore();
+            let status = std::process::Command::new(&app.program)
+                .args(&app.args)
+                .status();
+            *terminal = ratatui::init();
+            terminal.clear()?;
+            self.status = match status {
+                Ok(_) => format!("opened in {}", app.label),
+                Err(e) => format!("failed to launch {}: {e}", app.program),
+            };
+        } else {
+            // Detach: silence the child's stdio so a chatty GUI launcher can't
+            // scribble over the terminal, and don't wait on it.
+            use std::process::Stdio;
+            let spawned = std::process::Command::new(&app.program)
+                .args(&app.args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            self.status = match spawned {
+                Ok(_) => format!("opened in {}", app.label),
+                Err(e) => format!("failed to launch {}: {e}", app.program),
+            };
+        }
+        Ok(())
+    }
+
     // --- rendering --------------------------------------------------------
 
     fn render(&mut self, frame: &mut Frame) {
@@ -359,18 +539,110 @@ impl App {
         self.render_results(frame, body[0]);
         self.render_preview(frame, body[1]);
         self.render_status(frame, chunks[2]);
+
+        // Overlays draw on top of everything else.
+        if self.open_menu.is_some() {
+            self.render_open_menu(frame);
+        }
+        if self.show_help {
+            render_help(frame);
+        }
+    }
+
+    fn render_open_menu(&mut self, frame: &mut Frame) {
+        // Compute the title before borrowing the menu mutably for its state.
+        let filename = self
+            .selected()
+            .and_then(|r| r.path.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        let Some(menu) = self.open_menu.as_mut() else {
+            return;
+        };
+
+        // A clean, numbered list: press the number to launch, or arrow + Enter.
+        let items: Vec<ListItem> = menu
+            .apps
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let num = if i < 9 {
+                    format!(" {} ", i + 1)
+                } else {
+                    "   ".to_string()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        num,
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        a.label.clone(),
+                        Style::default()
+                            .fg(kind_color(a.kind))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]))
+            })
+            .collect();
+
+        // Size to content (each app is one row) plus borders, clamped to screen.
+        let rows = menu.apps.len() as u16 + 2;
+        let width = 52u16;
+        let area = centered_rect(
+            width,
+            rows.min(frame.area().height.saturating_sub(2)),
+            frame.area(),
+        );
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(Line::from(vec![
+                Span::styled(" Open ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(filename, Style::default().fg(Color::Yellow)),
+                Span::raw(" "),
+            ]))
+            .title_bottom(Line::from(Span::styled(
+                " 1-9 open · ↑/↓ move · Enter · Esc ",
+                Style::default().fg(Color::DarkGray),
+            )));
+
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(Style::default().bg(Color::DarkGray))
+            .highlight_symbol("▶ ");
+
+        frame.render_widget(Clear, area);
+        frame.render_stateful_widget(list, area, &mut menu.state);
     }
 
     fn render_query(&self, frame: &mut Frame, area: Rect) {
         let mode_tag = match self.mode {
-            Mode::Insert => Span::styled(" INSERT ", Style::default().bg(Color::Green).fg(Color::Black)),
-            Mode::Normal => Span::styled(" NORMAL ", Style::default().bg(Color::Blue).fg(Color::White)),
+            Mode::Insert => Span::styled(
+                " INSERT ",
+                Style::default().bg(Color::Green).fg(Color::Black),
+            ),
+            Mode::Normal => Span::styled(
+                " NORMAL ",
+                Style::default().bg(Color::Blue).fg(Color::White),
+            ),
         };
         let block = Block::default()
             .borders(Borders::ALL)
             .title(Line::from(vec![Span::raw(" deepsearch "), mode_tag]));
         let text = Line::from(vec![
-            Span::styled("❯ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "❯ ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(&self.input),
         ]);
         frame.render_widget(Paragraph::new(text).block(block), area);
@@ -409,10 +681,7 @@ impl App {
                         Style::default().fg(Color::Magenta),
                     ),
                     Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled(
-                        format!("  {parent}"),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(format!("  {parent}"), Style::default().fg(Color::DarkGray)),
                 ]);
                 ListItem::new(line)
             })
@@ -463,7 +732,7 @@ impl App {
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
-        let help = "↑/↓ or j/k move · Enter edit · Ctrl-U clear · Esc/q quit";
+        let help = "↑/↓ move · Enter open · o open-with · y copy · F1 help · Esc/q quit";
         let line = Line::from(vec![
             Span::styled(
                 format!(" {} ", self.status),
@@ -473,6 +742,83 @@ impl App {
             Span::styled(help, Style::default().fg(Color::DarkGray)),
         ]);
         frame.render_widget(Paragraph::new(line), area);
+    }
+}
+
+/// Colour used for an open-with entry's label, grouping it by kind at a glance.
+fn kind_color(kind: AppKind) -> Color {
+    match kind {
+        AppKind::Editor => Color::Cyan,
+        AppKind::Image => Color::Green,
+        AppKind::Pdf => Color::Red,
+        AppKind::Media => Color::Magenta,
+        AppKind::Default => Color::Yellow,
+        AppKind::Reveal | AppKind::Terminal => Color::Gray,
+    }
+}
+
+/// A centered overlay listing every keybinding.
+fn render_help(frame: &mut Frame) {
+    let rows: &[(&str, &str)] = &[
+        ("type", "edit the query (filters as you type)"),
+        ("ext:rs / type:pdf", "filter results by extension or type"),
+        ("↑ / ↓  ·  Ctrl-n / Ctrl-p", "move selection"),
+        ("PageUp / PageDown", "move by 10"),
+        ("Enter", "open in the right app for the file"),
+        ("o  ·  Ctrl-o", "open-with menu (choose an app)"),
+        ("y  ·  Ctrl-y", "copy the file path to the clipboard"),
+        ("Ctrl-u", "clear the query"),
+        ("Esc", "Insert → Normal mode"),
+        ("i  ·  /", "Normal → Insert mode"),
+        ("j / k  ·  g / G", "move / jump (Normal mode)"),
+        ("F1  ·  ? (Normal)", "show this help"),
+        ("q  ·  Esc  ·  Ctrl-c", "quit"),
+    ];
+
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(key, desc)| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {key:<26}"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(*desc, Style::default().fg(Color::Gray)),
+            ])
+        })
+        .collect();
+
+    let height = rows.len() as u16 + 2;
+    let area = centered_rect(64, height.min(frame.area().height), frame.area());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " Keys ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(Span::styled(
+            " any key to close ",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// A `Rect` of the given width/height centered inside `area` (clamped to fit).
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect {
+        x,
+        y,
+        width,
+        height,
     }
 }
 

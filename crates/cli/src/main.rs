@@ -6,6 +6,8 @@
 //!   * `tui [PATH]`     interactive fuzzy search UI.
 //!   * `stats`          report on the current index.
 
+mod clip;
+mod open;
 mod preview;
 mod tui;
 mod util;
@@ -21,7 +23,11 @@ use clap::{Parser, Subcommand};
 use deepsearch_core::{DeepSearch, IndexOptions, Progress, QueryOptions};
 
 #[derive(Parser)]
-#[command(name = "deepsearch", version, about = "Relevance-ranked full-text search over all your files")]
+#[command(
+    name = "deepsearch",
+    version,
+    about = "Relevance-ranked full-text search over all your files"
+)]
 struct Cli {
     /// Path to the index cache (default: ~/.cache/deepsearch/index.bin).
     #[arg(long, global = true)]
@@ -71,7 +77,9 @@ fn main() -> Result<()> {
         // No subcommand → refresh the index of your home dir, then open the TUI.
         None => cmd_default(cache),
         Some(Command::Index { path, incremental }) => cmd_index(cache, path, incremental),
-        Some(Command::Query { query, limit, json }) => cmd_query(cache, &query.join(" "), limit, json),
+        Some(Command::Query { query, limit, json }) => {
+            cmd_query(cache, &query.join(" "), limit, json)
+        }
         Some(Command::Tui { path }) => cmd_tui(cache, path),
         Some(Command::Stats) => cmd_stats(cache),
     }
@@ -81,7 +89,11 @@ fn default_root() -> Result<PathBuf> {
     dirs::home_dir().context("could not determine your home directory; pass a path explicitly")
 }
 
-fn cmd_index(cache: Option<&std::path::Path>, path: Option<PathBuf>, incremental: bool) -> Result<()> {
+fn cmd_index(
+    cache: Option<&std::path::Path>,
+    path: Option<PathBuf>,
+    incremental: bool,
+) -> Result<()> {
     let root = match path {
         Some(p) => p,
         None => default_root()?,
@@ -97,7 +109,11 @@ fn cmd_index(cache: Option<&std::path::Path>, path: Option<PathBuf>, incremental
 
     println!(
         "{} {}",
-        if incremental { "Updating index for" } else { "Indexing" },
+        if incremental {
+            "Updating index for"
+        } else {
+            "Indexing"
+        },
         root.display()
     );
 
@@ -117,14 +133,21 @@ fn cmd_index(cache: Option<&std::path::Path>, path: Option<PathBuf>, incremental
     ds.save(cache).context("saving index")?;
     println!(
         "Done: {} indexed, {} unchanged, {} removed, {} errors. {} live documents.",
-        stats.indexed, stats.unchanged, stats.removed, stats.errors, ds.len()
+        stats.indexed,
+        stats.unchanged,
+        stats.removed,
+        stats.errors,
+        ds.len()
     );
     Ok(())
 }
 
 fn cmd_query(cache: Option<&std::path::Path>, query: &str, limit: usize, json: bool) -> Result<()> {
     let ds = load_or_hint(cache)?;
-    let opts = QueryOptions { limit, ..QueryOptions::default() };
+    let opts = QueryOptions {
+        limit,
+        ..QueryOptions::default()
+    };
     let results = ds.search(query, &opts);
 
     if json {
@@ -155,7 +178,11 @@ fn cmd_default(cache: Option<&std::path::Path>) -> Result<()> {
     let fresh = ds.is_empty();
     println!(
         "{} {} ...",
-        if fresh { "Indexing" } else { "Refreshing index for" },
+        if fresh {
+            "Indexing"
+        } else {
+            "Refreshing index for"
+        },
         root.display()
     );
     with_progress("Indexing", |progress| {
@@ -178,7 +205,10 @@ fn cmd_tui(cache: Option<&std::path::Path>, path: Option<PathBuf>) -> Result<()>
             Some(p) => p,
             None => default_root()?,
         };
-        println!("No index found — building one for {} first...", root.display());
+        println!(
+            "No index found — building one for {} first...",
+            root.display()
+        );
         with_progress("Indexing", |progress| {
             ds.build(&root, &IndexOptions::default(), progress)
         });

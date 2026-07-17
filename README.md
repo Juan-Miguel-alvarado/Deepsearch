@@ -5,8 +5,11 @@ Relevance-ranked full-text search over **all** your files, from the terminal.
 `deepsearch` is not `find` or `grep`. It scans your filesystem **once**, builds a
 persistent inverted index, and then answers queries in **sub-millisecond** time,
 ranked by **BM25 relevance** — searching both file *names* and file *contents*.
-An interactive TUI gives you incremental search with live, syntax-highlighted
-previews (and image previews via the terminal graphics protocol).
+An interactive TUI gives you incremental search — matching prefixes as you type,
+with `type:`/`ext:` filters — live, syntax-highlighted previews (and image
+previews via the terminal graphics protocol), an **open-with** menu that
+launches the selected file in whatever app you have installed (editor, image/PDF
+viewer, media player, or the OS default), and one-key **copy-path**.
 
 ```
 deepsearch index ~/projects      # scan & index once (incremental afterwards)
@@ -16,11 +19,44 @@ deepsearch tui                   # interactive fuzzy search
 
 ---
 
-
 <img width="1352" height="718" alt="image" src="https://github.com/user-attachments/assets/81edafd6-d82f-406a-98d0-77a58a76a175" />
 
+---
 
+## Quickstart
 
+New here? Try it on a single folder in under a minute — no need to index your
+whole home directory. The `--cache` flag keeps this trial index separate from
+your real one:
+
+```bash
+# 1. build the project
+cargo build --release
+
+# 2. index just this repo into a throwaway cache
+./target/release/deepsearch --cache /tmp/ds-demo.bin index .
+
+# 3a. one-shot query from the shell
+./target/release/deepsearch --cache /tmp/ds-demo.bin query "bm25" 
+
+# 3b. or the interactive UI
+./target/release/deepsearch --cache /tmp/ds-demo.bin tui
+```
+
+Things to try inside the TUI:
+
+- **Type a partial word** (`conf`) — results filter as you type, before you
+  finish `config`.
+- **Filter** with `ext:rs parser` or `type:image` right in the query box.
+- Press **`Enter`** to open a file in the right app for its type (text in your
+  editor, an image in an image viewer, a PDF in a PDF reader…).
+- Press **`o`** for the **open-with menu** and hit a number to launch instantly.
+- Press **`y`** to **copy the file's path**, and **`F1`** for the key help.
+
+For real use, just run `deepsearch` with no arguments: it indexes your home
+directory the first time (incrementally after that), then opens the UI.
+
+---
 
 ## Architecture
 
@@ -36,7 +72,7 @@ Three layers, with a hard boundary between the engine and the UI:
 ┌───────────────┴──────────────────────────────┐
 │ crates/core  deepsearch-core (library)        │
 │   1. Indexer  — walk, extract, build index    │
-│   2. Query    — tokenize, BM25 rank, fuzzy     │
+│   2. Query    — tokenize, BM25, prefix, fuzzy  │
 │   (usable with no TUI, no CLI)                 │
 └──────────────────────────────────────────────┘
 ```
@@ -102,6 +138,19 @@ Fuzzy filename matching deliberately runs on the **unstemmed** tokens. Stemming 
 deployemnt`), which would inflate the edit distance and defeat the whole point.
 So the index keeps a second, unstemmed filename dictionary purely for fuzzy
 lookups.
+
+### Prefix matching: filter as you type
+An interactive search has to show useful results *before* you finish a word.
+When a query token isn't an exact filename term, it is treated as a **strict
+prefix** of the filename dictionary — so `conf` already surfaces `config.rs` and
+`configuration.rs`. Prefix hits score below an exact match but above a fuzzy one
+(`name_boost · prefix_penalty`, weighted by how much of the candidate word the
+prefix covers), so completing the word only sharpens the ranking rather than
+changing which files appear. The three name-field passes form a fallback chain —
+**exact → prefix → fuzzy** — and each stops the next, so the common case never
+pays for the approximate ones. Prefix matching runs on the same unstemmed
+filename dictionary as fuzzy, for the same reason (a half-typed word has no
+meaningful stem).
 
 ### Fuzzy matching: Damerau-Levenshtein, bounded
 Typos are matched against real filename words with **Damerau-Levenshtein**
@@ -175,6 +224,27 @@ deepsearch stats                   Index size, term counts, tombstone ratio.
         --cache <FILE>             Use a non-default index location (global flag).
 ```
 
+### Search filters
+
+Any query — from the shell or in the TUI — can carry inline filters that narrow
+results by file type or extension. They combine with search terms, and a filter
+on its own browses the corpus (newest first):
+
+| Filter | Matches |
+|--------|---------|
+| `type:image` (`img`) | images |
+| `type:pdf` | PDFs |
+| `type:code` / `type:text` | source / plain text |
+| `type:docx` (`doc`) | Word documents |
+| `type:binary` (`bin`) | other binaries |
+| `ext:rs`, `ext:.md` | files with that extension (dot optional) |
+
+```
+deepsearch query "parser ext:rs"     # 'parser' in .rs files only
+deepsearch query "invoice type:pdf"  # 'invoice' among PDFs
+deepsearch query "type:image"        # every image, most recent first
+```
+
 ### TUI keys
 | Key | Action |
 |-----|--------|
@@ -183,12 +253,29 @@ deepsearch stats                   Index size, term counts, tombstone ratio.
 | `Esc` | switch to Normal mode |
 | `j`/`k`, `g`/`G` | move / jump (Normal mode) |
 | `i` or `/` | back to Insert mode |
-| `Enter` | open the file in `$EDITOR` |
+| `Enter` | **open** the file in the right app for its type (see below) |
+| `o` (Normal) / `Ctrl-o` | **open with…** — a clean, numbered menu of installed apps |
+| `y` (Normal) / `Ctrl-y` | **copy** the selected file's path to the clipboard |
+| `F1` (any mode) / `?` (Normal) | show a **help overlay** listing every key |
 | `Ctrl-U` | clear the query |
 | `q` / `Esc` (Normal), `Ctrl-C` | quit |
 
 Two modes exist so the vim keys (`j`/`k`) can coexist with typing letters into
-the query box.
+the query box. Press `F1` any time (or `?` in Normal mode) for the full key list.
+
+**Smart open (`Enter`).** Opening does the sensible thing for the file type:
+text and source open in your `$EDITOR`, but an image opens in an image viewer, a
+PDF in a PDF reader, a video in a media player, and a Word doc / other file in
+the OS default handler — so you never get an image dumped as garbled text in the
+editor again.
+
+**Open-with menu (`o`).** A tidy popup that detects the applications actually
+installed on your `PATH` and orders them by relevance to the selected file
+(image viewers for an image, PDF readers for a PDF, …), then the OS default
+handler, then **Reveal in folder** and **Terminal here**. Press the number next
+to an entry to launch it instantly, or move with `↑`/`↓` and press `Enter`.
+Terminal apps (vim, helix, …) suspend the UI while they run; GUI apps launch
+detached so the search stays open.
 
 ---
 
@@ -222,8 +309,9 @@ cargo clippy --workspace --all-targets
 
 Unit tests cover the tokenizer (camel/snake splitting, stemming, edge cases), the
 inverted index (aggregates, tombstoning, compaction), BM25 scoring (idf
-monotonicity, relevance ordering, name-boost, fuzzy tolerance, tombstone
-exclusion), text extraction, incremental add/modify/delete, and the preview
+monotonicity, relevance ordering, name-boost, prefix matching, fuzzy tolerance,
+`type:`/`ext:` filter parsing, tombstone exclusion), text extraction,
+incremental add/modify/delete, the open-with app detection, and the preview
 match-overlay.
 
 ---

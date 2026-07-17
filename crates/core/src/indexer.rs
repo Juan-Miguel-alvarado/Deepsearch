@@ -106,7 +106,10 @@ pub fn build(
     *index = Index::new();
     let paths = walk(root, opts);
     progress.total.store(paths.len(), Ordering::Relaxed);
-    let mut stats = IndexStats { scanned: paths.len(), ..Default::default() };
+    let mut stats = IndexStats {
+        scanned: paths.len(),
+        ..Default::default()
+    };
     index_paths(index, &paths, progress, &mut stats);
     stats
 }
@@ -120,7 +123,10 @@ pub fn update(
 ) -> IndexStats {
     let paths = walk(root, opts);
     progress.total.store(paths.len(), Ordering::Relaxed);
-    let mut stats = IndexStats { scanned: paths.len(), ..Default::default() };
+    let mut stats = IndexStats {
+        scanned: paths.len(),
+        ..Default::default()
+    };
 
     // Detect deletions: previously indexed paths no longer present on disk.
     use std::collections::HashSet;
@@ -261,7 +267,12 @@ mod tests {
         write_file(dir.path(), "alpha.txt", "the quick brown fox");
         write_file(dir.path(), "beta.txt", "lazy dog sleeps");
         let mut idx = Index::new();
-        let stats = build(&mut idx, dir.path(), &IndexOptions::default(), &Progress::default());
+        let stats = build(
+            &mut idx,
+            dir.path(),
+            &IndexOptions::default(),
+            &Progress::default(),
+        );
         assert_eq!(stats.indexed, 2);
         assert_eq!(idx.live_docs, 2);
         let hits = crate::query::search(&idx, "fox", &crate::query::QueryOptions::default());
@@ -273,10 +284,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_file(dir.path(), "a.txt", "hello world");
         let mut idx = Index::new();
-        build(&mut idx, dir.path(), &IndexOptions::default(), &Progress::default());
+        build(
+            &mut idx,
+            dir.path(),
+            &IndexOptions::default(),
+            &Progress::default(),
+        );
 
         // Second run with no changes: nothing reindexed.
-        let stats = update(&mut idx, dir.path(), &IndexOptions::default(), &Progress::default());
+        let stats = update(
+            &mut idx,
+            dir.path(),
+            &IndexOptions::default(),
+            &Progress::default(),
+        );
         assert_eq!(stats.indexed, 0);
         assert_eq!(stats.unchanged, 1);
     }
@@ -286,11 +307,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_file(dir.path(), "gone.txt", "temporary content here");
         let mut idx = Index::new();
-        build(&mut idx, dir.path(), &IndexOptions::default(), &Progress::default());
+        build(
+            &mut idx,
+            dir.path(),
+            &IndexOptions::default(),
+            &Progress::default(),
+        );
         assert_eq!(idx.live_docs, 1);
 
         std::fs::remove_file(&p).unwrap();
-        let stats = update(&mut idx, dir.path(), &IndexOptions::default(), &Progress::default());
+        let stats = update(
+            &mut idx,
+            dir.path(),
+            &IndexOptions::default(),
+            &Progress::default(),
+        );
         assert_eq!(stats.removed, 1);
         assert_eq!(idx.live_docs, 0);
     }

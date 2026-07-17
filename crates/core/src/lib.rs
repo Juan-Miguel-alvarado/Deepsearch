@@ -88,7 +88,9 @@ impl DeepSearch {
 
     /// Start from an empty index.
     pub fn empty() -> Self {
-        DeepSearch { index: Index::new() }
+        DeepSearch {
+            index: Index::new(),
+        }
     }
 
     /// Default on-disk cache path: `~/.cache/deepsearch/index.bin`.
@@ -140,12 +142,16 @@ impl DeepSearch {
                 .with_context(|| format!("creating cache dir {}", parent.display()))?;
         }
         // Serialize by reference so we never clone the (potentially large) index.
-        let envelope = IndexFileRef { version: FORMAT_VERSION, index: &self.index };
+        let envelope = IndexFileRef {
+            version: FORMAT_VERSION,
+            index: &self.index,
+        };
         let bytes = bincode::serde::encode_to_vec(&envelope, bincode::config::standard())
             .context("serializing index")?;
         let tmp = path.with_extension("bin.tmp");
         std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("renaming into {}", path.display()))?;
         Ok(())
     }
 

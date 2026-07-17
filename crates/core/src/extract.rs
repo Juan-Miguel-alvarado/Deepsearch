@@ -69,7 +69,10 @@ pub fn extract(path: &Path) -> anyhow::Result<Extracted> {
     if let Some(kind) = infer::get(&head) {
         match kind.matcher_type() {
             infer::MatcherType::Image => {
-                return Ok(Extracted { file_type: FileType::Image, text: None });
+                return Ok(Extracted {
+                    file_type: FileType::Image,
+                    text: None,
+                });
             }
             _ => {
                 if kind.mime_type() == "application/pdf" {
@@ -79,18 +82,27 @@ pub fn extract(path: &Path) -> anyhow::Result<Extracted> {
                 // word document part.
                 if kind.mime_type() == "application/zip" {
                     if let Some(text) = try_extract_docx(path) {
-                        return Ok(Extracted { file_type: FileType::Docx, text: Some(text) });
+                        return Ok(Extracted {
+                            file_type: FileType::Docx,
+                            text: Some(text),
+                        });
                     }
                 }
                 // Some other known binary (archive, exe, media, ...).
-                return Ok(Extracted { file_type: FileType::Binary, text: None });
+                return Ok(Extracted {
+                    file_type: FileType::Binary,
+                    text: None,
+                });
             }
         }
     }
 
     // 2. No magic match: decide text vs binary from the sniffed bytes.
     if content_inspector::inspect(&head).is_binary() {
-        return Ok(Extracted { file_type: FileType::Binary, text: None });
+        return Ok(Extracted {
+            file_type: FileType::Binary,
+            text: None,
+        });
     }
 
     // 3. Plain text / source code: read the rest (capped) and keep it.
@@ -100,7 +112,10 @@ pub fn extract(path: &Path) -> anyhow::Result<Extracted> {
     let mut bytes = head;
     bytes.extend_from_slice(&rest);
     let text = String::from_utf8_lossy(&bytes).into_owned();
-    Ok(Extracted { file_type: FileType::Text, text: Some(text) })
+    Ok(Extracted {
+        file_type: FileType::Text,
+        text: Some(text),
+    })
 }
 
 fn read_up_to(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -123,10 +138,14 @@ fn extract_pdf(path: &Path) -> Extracted {
         pdf_extract::extract_text(&path)
     }));
     match result {
-        Ok(Ok(text)) if !text.trim().is_empty() => {
-            Extracted { file_type: FileType::Pdf, text: Some(text) }
-        }
-        _ => Extracted { file_type: FileType::Pdf, text: None },
+        Ok(Ok(text)) if !text.trim().is_empty() => Extracted {
+            file_type: FileType::Pdf,
+            text: Some(text),
+        },
+        _ => Extracted {
+            file_type: FileType::Pdf,
+            text: None,
+        },
     }
 }
 
@@ -183,7 +202,8 @@ mod tests {
     #[test]
     fn detects_binary() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        f.write_all(&[0u8, 159, 146, 150, 0, 1, 2, 3, 255, 254]).unwrap();
+        f.write_all(&[0u8, 159, 146, 150, 0, 1, 2, 3, 255, 254])
+            .unwrap();
         let e = extract(f.path()).unwrap();
         assert_eq!(e.file_type, FileType::Binary);
         assert!(e.text.is_none());

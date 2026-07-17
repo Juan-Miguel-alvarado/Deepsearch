@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+use crate::extract::FileType;
 use crate::index::Index;
 use crate::tokenize::{normalize, stem_word};
 
@@ -30,6 +31,13 @@ pub struct QueryOptions {
     /// Multiplier applied to filename-field scores (matches in the name count
     /// more than matches in the body).
     pub name_boost: f32,
+    /// Enable prefix matching against filename terms, so a partially-typed word
+    /// (`conf`) matches longer filename tokens (`config`). This is what makes
+    /// the interactive UI filter as you type.
+    pub prefix: bool,
+    /// Multiplier applied to prefix (incomplete-word) filename matches. Kept
+    /// below an exact match but above a fuzzy one.
+    pub prefix_penalty: f32,
     /// Enable Levenshtein fuzzy matching against filename terms.
     pub fuzzy: bool,
     /// Max edit distance for a fuzzy filename match.
@@ -46,6 +54,8 @@ impl Default for QueryOptions {
             k1: DEFAULT_K1,
             b: DEFAULT_B,
             name_boost: 3.0,
+            prefix: true,
+            prefix_penalty: 0.7,
             fuzzy: true,
             fuzzy_max_dist: 1,
             fuzzy_penalty: 0.4,
@@ -79,12 +89,24 @@ fn bm25_tf(tf: u32, doc_len: u32, avgdl: f32, k1: f32, b: f32) -> f32 {
 
 /// Rank documents in `index` for `query`, returning hits sorted by descending
 /// score (ties broken by ascending doc_id for determinism).
+///
+/// The query may carry inline **filters** that restrict results by file type or
+/// extension: `type:image logo`, `ext:rs parser`, `type:pdf` (filter only). See
+/// [`parse_filters`].
 pub fn search(index: &Index, query: &str, opts: &QueryOptions) -> Vec<Hit> {
+    if index.live_docs == 0 {
+        return Vec::new();
+    }
+    // Pull `type:`/`ext:` tokens out before tokenizing the rest as search terms.
+    let (clean, filters) = parse_filters(query);
+
     // Keep the unstemmed tokens so the fuzzy pass can compare typos against real
     // filename words; derive the stemmed term per token for exact matching.
-    let raw_terms = normalize(query);
-    if raw_terms.is_empty() || index.live_docs == 0 {
-        return Vec::new();
+    let raw_terms = normalize(&clean);
+    if raw_terms.is_empty() {
+        // A filter with no search terms ("show all my PDFs") browses the corpus:
+        // every matching live doc, most-recently-modified first.
+        return filter_only_hits(index, &filters, opts.limit);
     }
     let n = index.live_docs;
     let avg_content = index.avg_content_len();
@@ -96,7 +118,10 @@ pub fn search(index: &Index, query: &str, opts: &QueryOptions) -> Vec<Hit> {
         let term = stem_word(raw);
         // --- content field ---
         if let Some(postings) = index.content_index.get(&term) {
-            let live: Vec<_> = postings.iter().filter(|p| index.is_live(p.doc_id)).collect();
+            let live: Vec<_> = postings
+                .iter()
+                .filter(|p| index.is_live(p.doc_id))
+                .collect();
             let df = live.len() as u64;
             if df > 0 {
                 let term_idf = idf(n, df);
@@ -111,31 +136,43 @@ pub fn search(index: &Index, query: &str, opts: &QueryOptions) -> Vec<Hit> {
         // --- name field (exact) ---
         let mut name_hit = false;
         if let Some(postings) = index.name_index.get(&term) {
-            let live: Vec<_> = postings.iter().filter(|p| index.is_live(p.doc_id)).collect();
+            let live: Vec<_> = postings
+                .iter()
+                .filter(|p| index.is_live(p.doc_id))
+                .collect();
             let df = live.len() as u64;
             if df > 0 {
                 name_hit = true;
                 let term_idf = idf(n, df);
                 for p in live {
                     let dl = index.doc(p.doc_id).map(|d| d.name_len).unwrap_or(0);
-                    let s = opts.name_boost
-                        * term_idf
-                        * bm25_tf(p.tf, dl, avg_name, opts.k1, opts.b);
+                    let s =
+                        opts.name_boost * term_idf * bm25_tf(p.tf, dl, avg_name, opts.k1, opts.b);
                     *scores.entry(p.doc_id).or_insert(0.0) += s;
                 }
             }
         }
 
+        // --- name field (prefix fallback) ---
+        // When the exact term didn't hit a filename, treat it as a prefix so a
+        // half-typed word still matches (`conf` -> `config`). This drives the
+        // filter-as-you-type feel of the interactive UI.
+        let mut prefix_hit = false;
+        if opts.prefix && !name_hit {
+            prefix_hit = prefix_name_match(index, raw, opts, avg_name, n, &mut scores);
+        }
+
         // --- name field (fuzzy fallback) ---
-        // Only spend the linear scan when there was no exact name match, so the
-        // common case stays fast.
-        if opts.fuzzy && !name_hit {
+        // Only spend the linear scan when neither exact nor prefix matched, so
+        // the common case stays fast and typo tolerance is a last resort.
+        if opts.fuzzy && !name_hit && !prefix_hit {
             fuzzy_name_match(index, raw, opts, avg_name, n, &mut scores);
         }
     }
 
     let mut hits: Vec<Hit> = scores
         .into_iter()
+        .filter(|(doc_id, _)| filters.matches(index, *doc_id))
         .map(|(doc_id, score)| Hit { doc_id, score })
         .collect();
     hits.sort_by(|a, b| {
@@ -146,6 +183,163 @@ pub fn search(index: &Index, query: &str, opts: &QueryOptions) -> Vec<Hit> {
     });
     hits.truncate(opts.limit);
     hits
+}
+
+/// Post-ranking restrictions parsed out of the query string.
+#[derive(Debug, Default, PartialEq)]
+pub struct Filters {
+    /// Allowed extensions (lowercased, no dot). Empty = any.
+    pub exts: Vec<String>,
+    /// Allowed file types. Empty = any.
+    pub types: Vec<FileType>,
+}
+
+impl Filters {
+    pub fn is_empty(&self) -> bool {
+        self.exts.is_empty() && self.types.is_empty()
+    }
+
+    /// Whether the doc satisfies every active filter category (types AND exts;
+    /// within a category the values are OR-ed).
+    fn matches(&self, index: &Index, doc_id: u32) -> bool {
+        let Some(meta) = index.doc(doc_id) else {
+            return false;
+        };
+        if !self.types.is_empty() && !self.types.contains(&meta.file_type) {
+            return false;
+        }
+        if !self.exts.is_empty() {
+            let ext = meta
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_ascii_lowercase());
+            match ext {
+                Some(e) if self.exts.contains(&e) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+/// Split a raw query into (search text, filters), extracting `type:` and `ext:`
+/// tokens. `type:` accepts the [`FileType`] names plus a few aliases
+/// (`img`→image, `doc`→docx, `txt`→text); unknown values are dropped. Filters
+/// can repeat (`ext:rs ext:toml`) and combine with search terms.
+pub fn parse_filters(query: &str) -> (String, Filters) {
+    let mut filters = Filters::default();
+    let mut terms: Vec<&str> = Vec::new();
+
+    for tok in query.split_whitespace() {
+        if let Some(v) = strip_prefix_ci(tok, "ext:") {
+            let v = v.trim_start_matches('.').to_ascii_lowercase();
+            if !v.is_empty() {
+                filters.exts.push(v);
+            }
+        } else if let Some(v) = strip_prefix_ci(tok, "type:") {
+            if let Some(ft) = parse_file_type(&v.to_ascii_lowercase()) {
+                filters.types.push(ft);
+            }
+        } else {
+            terms.push(tok);
+        }
+    }
+    (terms.join(" "), filters)
+}
+
+/// Case-insensitive `strip_prefix` for ASCII filter keywords.
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+fn parse_file_type(v: &str) -> Option<FileType> {
+    Some(match v {
+        "text" | "txt" | "plain" => FileType::Text,
+        "code" | "source" => FileType::Code,
+        "pdf" => FileType::Pdf,
+        "docx" | "doc" | "word" => FileType::Docx,
+        "image" | "img" | "picture" => FileType::Image,
+        "binary" | "bin" => FileType::Binary,
+        _ => return None,
+    })
+}
+
+/// Results for a filter-only query: all matching live docs, newest first,
+/// carrying a score of 0 (there is nothing to rank).
+fn filter_only_hits(index: &Index, filters: &Filters, limit: usize) -> Vec<Hit> {
+    if filters.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<(i64, u32)> = index
+        .docs
+        .iter()
+        .flatten()
+        .filter(|m| filters.matches(index, m.id))
+        .map(|m| (m.mtime, m.id))
+        .collect();
+    // Most-recently-modified first; ties broken by doc_id for determinism.
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    hits.truncate(limit);
+    hits.into_iter()
+        .map(|(_, doc_id)| Hit { doc_id, score: 0.0 })
+        .collect()
+}
+
+/// Scan the **unstemmed** filename dictionary for tokens that have `raw` as a
+/// strict prefix (`conf` -> `config`, `configure`) and score their docs with a
+/// small penalty. Strict prefix (candidate longer than the query token) keeps
+/// this pass disjoint from the exact/fuzzy passes: a fully-typed token is served
+/// by those, an incomplete one by this.
+///
+/// Returns whether anything matched, so the caller can suppress the fuzzy pass.
+/// The scan is over the same dictionary as fuzzy matching; a single-character
+/// query is skipped so the very first keystroke doesn't select the whole corpus.
+fn prefix_name_match(
+    index: &Index,
+    raw: &str,
+    opts: &QueryOptions,
+    avg_name: f32,
+    n: u64,
+    scores: &mut HashMap<u32, f32>,
+) -> bool {
+    if raw.chars().count() < 2 {
+        return false;
+    }
+    let mut matched = false;
+    for (cand, doc_ids) in &index.name_fuzzy {
+        // Strict prefix: skip the exact token (handled by the exact pass) and
+        // anything that doesn't start with what the user typed.
+        if cand.len() <= raw.len() || !cand.starts_with(raw) {
+            continue;
+        }
+        let live: Vec<u32> = doc_ids
+            .iter()
+            .copied()
+            .filter(|&id| index.is_live(id))
+            .collect();
+        let df = live.len() as u64;
+        if df == 0 {
+            continue;
+        }
+        // A prefix that covers more of the candidate is a stronger signal
+        // (`config` typed as `confi` beats `config` typed as `co`).
+        let coverage = raw.chars().count() as f32 / cand.chars().count() as f32;
+        let factor = opts.name_boost * opts.prefix_penalty * (0.5 + 0.5 * coverage);
+        let term_idf = idf(n, df);
+        for id in live {
+            let dl = index.doc(id).map(|d| d.name_len).unwrap_or(0);
+            // Prefix hits carry an implicit term frequency of 1.
+            let s = factor * term_idf * bm25_tf(1, dl, avg_name, opts.k1, opts.b);
+            *scores.entry(id).or_insert(0.0) += s;
+        }
+        matched = true;
+    }
+    matched
 }
 
 /// Scan the **unstemmed** filename dictionary for tokens within
@@ -186,7 +380,11 @@ fn fuzzy_name_match(
         if dist == 0 || dist > opts.fuzzy_max_dist {
             continue;
         }
-        let live: Vec<u32> = doc_ids.iter().copied().filter(|&id| index.is_live(id)).collect();
+        let live: Vec<u32> = doc_ids
+            .iter()
+            .copied()
+            .filter(|&id| index.is_live(id))
+            .collect();
         let df = live.len() as u64;
         if df == 0 {
             continue;
@@ -251,7 +449,12 @@ mod tests {
     fn name_match_outranks_content_match() {
         let mut idx = Index::new();
         // doc0: "report" only in the body; doc1: "report" in the filename.
-        doc(&mut idx, "/a", &[("report", 1), ("filler", 20)], &[("a", 1)]);
+        doc(
+            &mut idx,
+            "/a",
+            &[("report", 1), ("filler", 20)],
+            &[("a", 1)],
+        );
         doc(&mut idx, "/report", &[("filler", 1)], &[("report", 1)]);
         let hits = search(&idx, "report", &QueryOptions::default());
         assert_eq!(hits[0].doc_id, 1);
@@ -268,10 +471,92 @@ mod tests {
     }
 
     #[test]
+    fn prefix_matches_incomplete_word() {
+        let mut idx = Index::new();
+        doc(
+            &mut idx,
+            "/config.rs",
+            &[("stuff", 1)],
+            &[("config", 1), ("rs", 1)],
+        );
+        doc(
+            &mut idx,
+            "/other.rs",
+            &[("stuff", 1)],
+            &[("other", 1), ("rs", 1)],
+        );
+        // "conf" is a strict prefix of "config" but of nothing in /other.rs.
+        let hits = search(&idx, "conf", &QueryOptions::default());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, 0);
+    }
+
+    #[test]
+    fn prefix_ignored_when_disabled() {
+        let mut idx = Index::new();
+        doc(&mut idx, "/config.rs", &[("stuff", 1)], &[("config", 1)]);
+        let opts = QueryOptions {
+            prefix: false,
+            fuzzy: false,
+            ..QueryOptions::default()
+        };
+        assert!(search(&idx, "conf", &opts).is_empty());
+    }
+
+    #[test]
+    fn ext_filter_restricts_results() {
+        let mut idx = Index::new();
+        doc(&mut idx, "/notes.md", &[("report", 3)], &[("notes", 1)]);
+        doc(&mut idx, "/report.txt", &[("report", 3)], &[("report", 1)]);
+        // Same term, but only the .md file should survive `ext:md`.
+        let hits = search(&idx, "report ext:md", &QueryOptions::default());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, 0);
+    }
+
+    #[test]
+    fn type_filter_only_browses_corpus() {
+        let mut idx = Index::new();
+        // No search terms — a bare `type:` filter lists matching docs.
+        idx.add(PendingDoc {
+            path: PathBuf::from("/a.png"),
+            size: 1,
+            mtime: 10,
+            file_type: FileType::Image,
+            content_tf: tf(&[]),
+            name_tf: tf(&[("a", 1)]),
+            name_raw: vec!["a".to_string()],
+        });
+        idx.add(PendingDoc {
+            path: PathBuf::from("/b.txt"),
+            size: 1,
+            mtime: 20,
+            file_type: FileType::Text,
+            content_tf: tf(&[("hi", 1)]),
+            name_tf: tf(&[("b", 1)]),
+            name_raw: vec!["b".to_string()],
+        });
+        let hits = search(&idx, "type:image", &QueryOptions::default());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, 0);
+    }
+
+    #[test]
+    fn parse_filters_splits_terms_and_filters() {
+        let (clean, f) = parse_filters("ext:.RS parser TYPE:img");
+        assert_eq!(clean, "parser");
+        assert_eq!(f.exts, vec!["rs".to_string()]);
+        assert_eq!(f.types, vec![FileType::Image]);
+    }
+
+    #[test]
     fn fuzzy_ignored_when_disabled() {
         let mut idx = Index::new();
         doc(&mut idx, "/config", &[("stuff", 1)], &[("config", 1)]);
-        let opts = QueryOptions { fuzzy: false, ..QueryOptions::default() };
+        let opts = QueryOptions {
+            fuzzy: false,
+            ..QueryOptions::default()
+        };
         assert!(search(&idx, "cofnig", &opts).is_empty());
     }
 

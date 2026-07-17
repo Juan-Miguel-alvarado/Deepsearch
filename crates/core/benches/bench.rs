@@ -9,19 +9,45 @@ use std::path::Path;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
+use deepsearch_core::index::Index;
 use deepsearch_core::indexer::{build, IndexOptions, Progress};
 use deepsearch_core::query::{search, QueryOptions};
-use deepsearch_core::index::Index;
 
 /// Number of synthetic documents. Kept modest so `cargo bench` stays quick in
 /// CI; raise locally to stress-test.
 const CORPUS: usize = 10_000;
 
 const WORDS: &[&str] = &[
-    "rust", "index", "search", "engine", "token", "vector", "matrix", "ranking",
-    "query", "document", "corpus", "score", "relevance", "inverted", "posting",
-    "filesystem", "parallel", "stemming", "camel", "snake", "config", "server",
-    "client", "async", "future", "thread", "memory", "cache", "buffer", "stream",
+    "rust",
+    "index",
+    "search",
+    "engine",
+    "token",
+    "vector",
+    "matrix",
+    "ranking",
+    "query",
+    "document",
+    "corpus",
+    "score",
+    "relevance",
+    "inverted",
+    "posting",
+    "filesystem",
+    "parallel",
+    "stemming",
+    "camel",
+    "snake",
+    "config",
+    "server",
+    "client",
+    "async",
+    "future",
+    "thread",
+    "memory",
+    "cache",
+    "buffer",
+    "stream",
 ];
 
 fn word(seed: usize) -> &'static str {
@@ -44,7 +70,12 @@ fn make_corpus(dir: &Path) {
 
 fn build_index(dir: &Path) -> Index {
     let mut idx = Index::new();
-    build(&mut idx, dir, &IndexOptions::default(), &Progress::default());
+    build(
+        &mut idx,
+        dir,
+        &IndexOptions::default(),
+        &Progress::default(),
+    );
     idx
 }
 

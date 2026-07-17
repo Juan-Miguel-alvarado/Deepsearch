@@ -108,7 +108,10 @@ mod tests {
 
     #[test]
     fn handles_acronyms() {
-        assert_eq!(tokenize("HTTPServerConfig"), vec!["http", "server", "config"]);
+        assert_eq!(
+            tokenize("HTTPServerConfig"),
+            vec!["http", "server", "config"]
+        );
     }
 
     #[test]

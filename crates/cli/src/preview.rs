@@ -85,7 +85,10 @@ impl PreviewWorker {
             }
         });
 
-        PreviewWorker { tx: req_tx, rx: resp_rx }
+        PreviewWorker {
+            tx: req_tx,
+            rx: resp_rx,
+        }
     }
 
     pub fn request(&self, req: PreviewRequest) {
@@ -129,7 +132,9 @@ fn image_preview(req: &PreviewRequest) -> Preview {
 /// Metadata-only preview for binaries.
 fn meta_preview(req: &PreviewRequest) -> Preview {
     let mut lines = Vec::new();
-    let key = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let key = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let val = Style::default().fg(Color::Gray);
     let kv = |k: &str, v: String| {
         Line::from(vec![
@@ -144,7 +149,9 @@ fn meta_preview(req: &PreviewRequest) -> Preview {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "(binary file — no text preview)",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
     )));
     Preview::Meta(Text::from(lines))
 }
@@ -187,7 +194,9 @@ fn text_preview(syntaxes: &SyntaxSet, theme: &Theme, req: &PreviewRequest) -> Pr
     if content.lines().count() > MAX_PREVIEW_LINES {
         lines.push(Line::from(Span::styled(
             format!("… (truncated at {MAX_PREVIEW_LINES} lines)"),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )));
     }
 
@@ -221,16 +230,14 @@ fn read_capped(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let mut buf = Vec::new();
-    f.by_ref().take(MAX_PREVIEW_BYTES as u64).read_to_end(&mut buf)?;
+    f.by_ref()
+        .take(MAX_PREVIEW_BYTES as u64)
+        .read_to_end(&mut buf)?;
     Ok(buf)
 }
 
 fn syn_to_ratatui(s: SynStyle) -> Style {
-    Style::default().fg(Color::Rgb(
-        s.foreground.r,
-        s.foreground.g,
-        s.foreground.b,
-    ))
+    Style::default().fg(Color::Rgb(s.foreground.r, s.foreground.g, s.foreground.b))
 }
 
 /// Overlay query-match highlighting on a line's styled spans.
@@ -294,7 +301,11 @@ fn overlay_matches(spans: Vec<(Style, String)>, terms: &[String]) -> Line<'stati
         if buf.is_empty() {
             return;
         }
-        let style = if is_match { style.add_modifier(hl) } else { style };
+        let style = if is_match {
+            style.add_modifier(hl)
+        } else {
+            style
+        };
         out.push(Span::styled(std::mem::take(buf), style));
     };
     for i in 0..chars.len() {
@@ -316,7 +327,10 @@ mod tests {
     #[test]
     fn overlay_marks_matches() {
         let base = Style::default();
-        let line = overlay_matches(vec![(base, "hello world".to_string())], &["world".to_string()]);
+        let line = overlay_matches(
+            vec![(base, "hello world".to_string())],
+            &["world".to_string()],
+        );
         // Expect two spans: "hello " (plain) and "world" (highlighted).
         assert!(line.spans.len() >= 2);
         let highlighted: String = line
