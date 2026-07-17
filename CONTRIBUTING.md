@@ -53,6 +53,20 @@ cargo run --release --example scale -p deepsearch-core
    `crates/core`; match that style (`#[cfg(test)] mod tests` at the bottom of
    the file, `tempfile` for anything touching the filesystem).
 
+## Releasing
+
+Releases are automated. Bump `version` in the workspace `Cargo.toml`, commit,
+then tag and push:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The `Release` workflow builds binaries for Linux, macOS (Intel + Apple Silicon)
+and Windows and attaches them (with `.sha256` checksums) to a GitHub Release for
+that tag. `CI` runs fmt + clippy + tests on every push and PR.
+
 ## Design notes
 
 The README's **"Design decisions (and why)"** section explains the choices

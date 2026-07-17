@@ -1,5 +1,8 @@
 # deepsearch
 
+[![CI](https://github.com/Juan-Miguel-alvarado/Deepsearch/actions/workflows/ci.yml/badge.svg)](https://github.com/Juan-Miguel-alvarado/Deepsearch/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Juan-Miguel-alvarado/Deepsearch?sort=semver)](https://github.com/Juan-Miguel-alvarado/Deepsearch/releases/latest)
+
 Relevance-ranked full-text search over **all** your files, from the terminal.
 
 `deepsearch` is not `find` or `grep`. It scans your filesystem **once**, builds a
@@ -26,6 +29,53 @@ deepsearch tui                   # interactive fuzzy search
 https://github.com/user-attachments/assets/f68476ca-0f2e-4101-a1b6-f9b6e720894e
 
 
+
+---
+
+## Installation
+
+Pick whichever fits you. After installing, run `deepsearch` from anywhere.
+
+### 1. Download a prebuilt binary (no Rust needed)
+
+Grab the archive for your platform from the
+[**latest release**](https://github.com/Juan-Miguel-alvarado/Deepsearch/releases/latest),
+extract it, and put the `deepsearch` binary on your `PATH`.
+
+**Linux / macOS:**
+
+```bash
+# pick the file matching your platform from the releases page, e.g.:
+#   deepsearch-x86_64-unknown-linux-gnu.tar.gz   (Linux, Intel/AMD)
+#   deepsearch-aarch64-apple-darwin.tar.gz       (macOS, Apple Silicon)
+#   deepsearch-x86_64-apple-darwin.tar.gz        (macOS, Intel)
+tar -xzf deepsearch-*.tar.gz
+sudo mv deepsearch /usr/local/bin/     # or: mv deepsearch ~/.local/bin/
+deepsearch --version
+```
+
+**Windows:** download `deepsearch-x86_64-pc-windows-msvc.zip`, unzip it, and put
+`deepsearch.exe` in a folder that's on your `PATH`.
+
+Each archive ships a `.sha256` file so you can verify the download
+(`shasum -a 256 -c deepsearch-*.tar.gz.sha256`).
+
+### 2. Install with Cargo (from source, needs [Rust](https://rustup.rs))
+
+```bash
+cargo install --git https://github.com/Juan-Miguel-alvarado/Deepsearch deepsearch
+```
+
+This builds and drops `deepsearch` into `~/.cargo/bin` (already on your `PATH`
+if you use rustup). Re-run the same command to update.
+
+### 3. Build from a local clone
+
+```bash
+git clone https://github.com/Juan-Miguel-alvarado/Deepsearch
+cd Deepsearch
+cargo install --path crates/cli --force
+```
 
 ---
 

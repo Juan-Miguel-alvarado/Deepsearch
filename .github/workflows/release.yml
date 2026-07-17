@@ -1,0 +1,68 @@
+name: Release
+
+# Publishes downloadable binaries whenever a version tag (e.g. v0.1.0) is pushed.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p deepsearch
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          dir="target/${{ matrix.target }}/release"
+          tar -czf "deepsearch-${{ matrix.target }}.tar.gz" -C "$dir" deepsearch
+          shasum -a 256 "deepsearch-${{ matrix.target }}.tar.gz" > "deepsearch-${{ matrix.target }}.tar.gz.sha256"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "target/${{ matrix.target }}/release"
+          Compress-Archive -Path "$dir/deepsearch.exe" -DestinationPath "deepsearch-${{ matrix.target }}.zip"
+          (Get-FileHash "deepsearch-${{ matrix.target }}.zip" -Algorithm SHA256).Hash | Out-File "deepsearch-${{ matrix.target }}.zip.sha256"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            deepsearch-${{ matrix.target }}.tar.gz
+            deepsearch-${{ matrix.target }}.tar.gz.sha256
+            deepsearch-${{ matrix.target }}.zip
+            deepsearch-${{ matrix.target }}.zip.sha256
+          fail_on_unmatched_files: false
+          generate_release_notes: true
