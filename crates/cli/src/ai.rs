@@ -155,6 +155,93 @@ pub fn translate_query(request: &str) -> Result<String, String> {
     Ok(query)
 }
 
+/// Default embedding model (small, local, good for retrieval).
+const DEFAULT_EMBED_MODEL: &str = "nomic-embed-text";
+
+fn embed_model() -> String {
+    match std::env::var("DEEPSEARCH_OLLAMA_EMBED_MODEL") {
+        Ok(m) if !m.trim().is_empty() => m.trim().to_string(),
+        _ => DEFAULT_EMBED_MODEL.to_string(),
+    }
+}
+
+/// Whether the embedding model is installed in the local Ollama.
+pub fn embed_available() -> bool {
+    let want = embed_model();
+    installed_models()
+        .map(|ms| {
+            ms.iter()
+                .any(|m| m == &want || m.split(':').next() == Some(want.as_str()))
+        })
+        .unwrap_or(false)
+}
+
+/// A hint shown to the user when embeddings are needed but unavailable.
+pub fn embed_setup_hint() -> String {
+    format!(
+        "semantic search needs a local embedding model. Install Ollama \
+(https://ollama.com) and run `ollama pull {}`.",
+        embed_model()
+    )
+}
+
+/// Embed `text` into a unit-normalized vector via Ollama. `is_query` selects the
+/// task prefix nomic-style models expect (queries and documents share the space
+/// but are prefixed differently).
+pub fn embed(text: &str, is_query: bool) -> Result<Vec<f32>, String> {
+    let model = embed_model();
+    let prefix = if is_query {
+        "search_query: "
+    } else {
+        "search_document: "
+    };
+    let payload = serde_json::json!({
+        "model": model,
+        "prompt": format!("{prefix}{}", cap_text(text)),
+    });
+    let resp = gen_agent()
+        .post(&format!("{}/api/embeddings", host()))
+        .send_json(payload)
+        .map_err(|e| format!("embedding request failed: {e}"))?;
+    let body: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("bad embedding response: {e}"))?;
+    let arr = body
+        .get("embedding")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("no embedding returned. {}", embed_setup_hint()))?;
+    let mut v: Vec<f32> = arr
+        .iter()
+        .filter_map(|x| x.as_f64().map(|f| f as f32))
+        .collect();
+    if v.is_empty() {
+        return Err("empty embedding returned".to_string());
+    }
+    normalize(&mut v);
+    Ok(v)
+}
+
+/// Unit-normalize in place so downstream ranking can use a plain dot product.
+fn normalize(v: &mut [f32]) {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+}
+
+/// Cap the text we embed: models have a context limit and very long documents
+/// add latency without improving retrieval much.
+fn cap_text(text: &str) -> String {
+    const MAX_CHARS: usize = 8000;
+    if text.chars().count() <= MAX_CHARS {
+        text.to_string()
+    } else {
+        text.chars().take(MAX_CHARS).collect()
+    }
+}
+
 /// Clean the model's reply down to a single usable query line: take the first
 /// non-empty line, drop a leading "Query:" echo and any surrounding quotes or
 /// code fences.

@@ -108,13 +108,21 @@ pub fn search(index: &Index, query: &str, opts: &QueryOptions) -> Vec<Hit> {
         // every matching live doc, most-recently-modified first.
         return filter_only_hits(index, &filters, opts.limit);
     }
+    let scores = keyword_scores(index, &raw_terms, opts);
+    finalize(scores, index, &filters, opts.limit)
+}
+
+/// Accumulate BM25 keyword scores for the (unstemmed) `raw_terms` over the
+/// content and filename fields, including the prefix and fuzzy filename
+/// fallbacks. Shared by keyword and hybrid search.
+fn keyword_scores(index: &Index, raw_terms: &[String], opts: &QueryOptions) -> HashMap<u32, f32> {
     let n = index.live_docs;
     let avg_content = index.avg_content_len();
     let avg_name = index.avg_name_len();
 
     let mut scores: HashMap<u32, f32> = HashMap::new();
 
-    for raw in &raw_terms {
+    for raw in raw_terms {
         let term = stem_word(raw);
         // --- content field ---
         if let Some(postings) = index.content_index.get(&term) {
@@ -170,6 +178,12 @@ pub fn search(index: &Index, query: &str, opts: &QueryOptions) -> Vec<Hit> {
         }
     }
 
+    scores
+}
+
+/// Apply filters, sort by descending score (ties broken by ascending doc_id for
+/// determinism), and cap to `limit`.
+fn finalize(scores: HashMap<u32, f32>, index: &Index, filters: &Filters, limit: usize) -> Vec<Hit> {
     let mut hits: Vec<Hit> = scores
         .into_iter()
         .filter(|(doc_id, _)| filters.matches(index, *doc_id))
@@ -181,8 +195,95 @@ pub fn search(index: &Index, query: &str, opts: &QueryOptions) -> Vec<Hit> {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.doc_id.cmp(&b.doc_id))
     });
-    hits.truncate(opts.limit);
+    hits.truncate(limit);
     hits
+}
+
+/// Dot product of two equal-length vectors. For unit-normalized embeddings this
+/// equals cosine similarity.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// Rank documents purely by semantic similarity to `query_vec` (assumed
+/// unit-normalized). Only docs carrying an embedding of matching dimension
+/// participate.
+pub fn semantic_search(index: &Index, query_vec: &[f32], limit: usize) -> Vec<Hit> {
+    if index.live_docs == 0 || query_vec.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<Hit> = index
+        .docs
+        .iter()
+        .flatten()
+        .filter_map(|m| {
+            let emb = m.embedding.as_ref()?;
+            (emb.len() == query_vec.len()).then(|| Hit {
+                doc_id: m.id,
+                score: dot(query_vec, emb),
+            })
+        })
+        .collect();
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.doc_id.cmp(&b.doc_id))
+    });
+    hits.truncate(limit);
+    hits
+}
+
+/// Hybrid ranking: blend keyword (BM25) relevance with semantic similarity.
+///
+/// Keyword scores are min-max normalized to `[0, 1]`; semantic similarity uses
+/// the positive part of cosine. The two are combined as
+/// `(1 - w)·keyword + w·semantic`, where `w = semantic_weight`. The union of
+/// docs that match either signal is returned, so a file can surface by meaning
+/// even with no keyword hit (and vice-versa). Inline `type:`/`ext:` filters
+/// still apply.
+pub fn hybrid_search(
+    index: &Index,
+    query: &str,
+    query_vec: &[f32],
+    opts: &QueryOptions,
+    semantic_weight: f32,
+) -> Vec<Hit> {
+    if index.live_docs == 0 {
+        return Vec::new();
+    }
+    let (clean, filters) = parse_filters(query);
+    let raw_terms = normalize(&clean);
+    let w = semantic_weight.clamp(0.0, 1.0);
+
+    let mut combined: HashMap<u32, f32> = HashMap::new();
+
+    // Keyword side, normalized by its own maximum so the blend is scale-free.
+    if !raw_terms.is_empty() {
+        let kw = keyword_scores(index, &raw_terms, opts);
+        let kw_max = kw.values().copied().fold(0.0_f32, f32::max);
+        if kw_max > 0.0 {
+            for (id, s) in kw {
+                *combined.entry(id).or_insert(0.0) += (1.0 - w) * (s / kw_max);
+            }
+        }
+    }
+
+    // Semantic side: positive cosine similarity against the query vector.
+    if !query_vec.is_empty() && w > 0.0 {
+        for m in index.docs.iter().flatten() {
+            if let Some(emb) = &m.embedding {
+                if emb.len() == query_vec.len() {
+                    let sim = dot(query_vec, emb).max(0.0);
+                    if sim > 0.0 {
+                        *combined.entry(m.id).or_insert(0.0) += w * sim;
+                    }
+                }
+            }
+        }
+    }
+
+    finalize(combined, index, &filters, opts.limit)
 }
 
 /// Post-ranking restrictions parsed out of the query string.
@@ -575,6 +676,33 @@ mod tests {
         );
         let hits = search(&idx, "type:code", &QueryOptions::default());
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn semantic_ranks_by_cosine() {
+        let mut idx = Index::new();
+        doc(&mut idx, "/a", &[("x", 1)], &[("a", 1)]);
+        doc(&mut idx, "/b", &[("y", 1)], &[("b", 1)]);
+        idx.set_embedding(0, vec![1.0, 0.0]);
+        idx.set_embedding(1, vec![0.0, 1.0]);
+        // Query vector leans toward doc0's embedding.
+        let hits = semantic_search(&idx, &[0.9, 0.1], 10);
+        assert_eq!(hits[0].doc_id, 0);
+    }
+
+    #[test]
+    fn hybrid_surfaces_semantic_only_match() {
+        let mut idx = Index::new();
+        // doc0 matches the keyword; doc1 matches only by embedding.
+        doc(&mut idx, "/a", &[("login", 1)], &[("a", 1)]);
+        doc(&mut idx, "/b", &[("auth", 1)], &[("b", 1)]);
+        idx.set_embedding(0, vec![0.0, 1.0]);
+        idx.set_embedding(1, vec![1.0, 0.0]);
+        // Query vector points at doc1; keyword "login" points at doc0.
+        let hits = hybrid_search(&idx, "login", &[1.0, 0.0], &QueryOptions::default(), 0.5);
+        let ids: Vec<u32> = hits.iter().map(|h| h.doc_id).collect();
+        assert!(ids.contains(&0), "keyword match present");
+        assert!(ids.contains(&1), "semantic-only match surfaced");
     }
 
     #[test]

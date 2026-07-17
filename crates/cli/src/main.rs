@@ -49,6 +49,10 @@ enum Command {
         /// Reindex only changed files instead of a full rebuild.
         #[arg(long)]
         incremental: bool,
+        /// Also compute semantic embeddings (search by meaning). Needs a local
+        /// Ollama with an embedding model (`ollama pull nomic-embed-text`).
+        #[arg(long)]
+        semantic: bool,
     },
     /// Run a one-shot query and print ranked results.
     Query {
@@ -61,6 +65,9 @@ enum Command {
         /// Emit results as JSON.
         #[arg(long)]
         json: bool,
+        /// Force keyword-only ranking even if the index has embeddings.
+        #[arg(long)]
+        keyword: bool,
     },
     /// Ask in plain language; a local Ollama model turns it into a query.
     Ask {
@@ -90,10 +97,17 @@ fn main() -> Result<()> {
     match cli.cmd {
         // No subcommand → refresh the index of your home dir, then open the TUI.
         None => cmd_default(cache),
-        Some(Command::Index { path, incremental }) => cmd_index(cache, path, incremental),
-        Some(Command::Query { query, limit, json }) => {
-            cmd_query(cache, &query.join(" "), limit, json)
-        }
+        Some(Command::Index {
+            path,
+            incremental,
+            semantic,
+        }) => cmd_index(cache, path, incremental, semantic),
+        Some(Command::Query {
+            query,
+            limit,
+            json,
+            keyword,
+        }) => cmd_query(cache, &query.join(" "), limit, json, keyword),
         Some(Command::Ask {
             request,
             limit,
@@ -112,6 +126,7 @@ fn cmd_index(
     cache: Option<&std::path::Path>,
     path: Option<PathBuf>,
     incremental: bool,
+    semantic: bool,
 ) -> Result<()> {
     let root = match path {
         Some(p) => p,
@@ -158,16 +173,97 @@ fn cmd_index(
         stats.errors,
         ds.len()
     );
+
+    if semantic {
+        build_embeddings(&mut ds, cache)?;
+    }
     Ok(())
 }
 
-fn cmd_query(cache: Option<&std::path::Path>, query: &str, limit: usize, json: bool) -> Result<()> {
+/// Weight of the semantic signal in hybrid ranking (0 = keyword only, 1 = pure
+/// semantic).
+const SEMANTIC_WEIGHT: f32 = 0.5;
+
+/// Compute a semantic embedding for every document that lacks one, via Ollama,
+/// then persist. Documents with no extractable text fall back to embedding their
+/// file name so they can still be found by meaning.
+fn build_embeddings(ds: &mut DeepSearch, cache: Option<&std::path::Path>) -> Result<()> {
+    if !ai::embed_available() {
+        println!("Skipping embeddings: {}", ai::embed_setup_hint());
+        return Ok(());
+    }
+    let todo = ds.docs_needing_embedding();
+    let total = todo.len();
+    if total == 0 {
+        println!("Embeddings already up to date.");
+        return Ok(());
+    }
+    println!("Building semantic embeddings for {total} documents (local Ollama)...");
+
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    for (id, path) in todo {
+        let text = match deepsearch_core::extract::extract(&path) {
+            Ok(e) => e.text.unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        // No body text (image/binary): embed the file name instead.
+        let basis = if text.trim().is_empty() {
+            path.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            text
+        };
+        if basis.trim().is_empty() {
+            continue;
+        }
+        match ai::embed(&basis, false) {
+            Ok(v) => ds.set_embedding(id, v),
+            Err(_) => failed += 1,
+        }
+        done += 1;
+        if done.is_multiple_of(10) || done == total {
+            eprint!("\rembedded {done}/{total}      ");
+        }
+    }
+    eprintln!("\rembedded {done}/{total} documents ({failed} failed).      ");
+    ds.save(cache).context("saving embeddings")?;
+    Ok(())
+}
+
+/// Run a search, using hybrid keyword+semantic ranking when the index has
+/// embeddings and Ollama is reachable; otherwise plain keyword search.
+fn run_search(
+    ds: &DeepSearch,
+    query: &str,
+    opts: &QueryOptions,
+    keyword_only: bool,
+) -> (Vec<deepsearch_core::SearchResult>, bool) {
+    if !keyword_only && ds.has_embeddings() && ai::available() {
+        if let Ok(qv) = ai::embed(query, true) {
+            return (ds.hybrid_search(query, &qv, opts, SEMANTIC_WEIGHT), true);
+        }
+    }
+    (ds.search(query, opts), false)
+}
+
+fn cmd_query(
+    cache: Option<&std::path::Path>,
+    query: &str,
+    limit: usize,
+    json: bool,
+    keyword: bool,
+) -> Result<()> {
     let ds = load_or_hint(cache)?;
     let opts = QueryOptions {
         limit,
         ..QueryOptions::default()
     };
-    let results = ds.search(query, &opts);
+    let (results, semantic) = run_search(&ds, query, &opts, keyword);
+    if semantic && !json {
+        eprintln!("(hybrid keyword + semantic)");
+    }
 
     if json {
         print_json(&results);
@@ -209,7 +305,7 @@ fn cmd_ask(cache: Option<&std::path::Path>, request: &str, limit: usize, json: b
         limit,
         ..QueryOptions::default()
     };
-    let results = ds.search(&query, &opts);
+    let (results, _) = run_search(&ds, &query, &opts, false);
     if json {
         print_json(&results);
     } else if results.is_empty() {

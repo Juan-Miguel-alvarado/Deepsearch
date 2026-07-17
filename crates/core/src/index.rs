@@ -39,6 +39,11 @@ pub struct DocMeta {
     pub content_len: u32,
     /// Number of filename tokens.
     pub name_len: u32,
+    /// Optional **unit-normalized** semantic embedding of the document, used for
+    /// meaning-based (as opposed to keyword) ranking. `None` until the index is
+    /// built with embeddings enabled.
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// A fully-tokenized document ready to be merged into the index.
@@ -107,6 +112,20 @@ impl Index {
         self.doc(id).is_some()
     }
 
+    /// Attach a semantic embedding to a live document (no-op for dead slots).
+    /// The vector should already be unit-normalized so ranking can use a plain
+    /// dot product.
+    pub fn set_embedding(&mut self, id: u32, embedding: Vec<f32>) {
+        if let Some(Some(meta)) = self.docs.get_mut(id as usize) {
+            meta.embedding = Some(embedding);
+        }
+    }
+
+    /// Whether any live document carries a semantic embedding.
+    pub fn has_embeddings(&self) -> bool {
+        self.docs.iter().flatten().any(|m| m.embedding.is_some())
+    }
+
     /// Add a freshly tokenized document, returning its new `doc_id`.
     pub fn add(&mut self, pending: PendingDoc) -> u32 {
         let id = self.docs.len() as u32;
@@ -139,6 +158,7 @@ impl Index {
             file_type: pending.file_type,
             content_len,
             name_len,
+            embedding: None,
         }));
 
         self.live_docs += 1;

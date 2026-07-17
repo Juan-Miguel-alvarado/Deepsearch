@@ -42,7 +42,7 @@ pub use query::QueryOptions;
 
 /// Serialized index format version. Bumped when the on-disk layout changes so a
 /// stale cache is rejected instead of misread.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 /// Errors surfaced by the high-level API.
 #[derive(Debug, thiserror::Error)]
@@ -189,10 +189,55 @@ impl DeepSearch {
         &self.index
     }
 
-    /// Run a ranked search, resolving metadata onto each hit.
+    /// Run a ranked keyword search, resolving metadata onto each hit.
     pub fn search(&self, query: &str, opts: &QueryOptions) -> Vec<SearchResult> {
-        query::search(&self.index, query, opts)
-            .into_iter()
+        self.resolve(query::search(&self.index, query, opts))
+    }
+
+    /// Hybrid keyword + semantic search. `query_vec` is the (unit-normalized)
+    /// embedding of the query; `semantic_weight` (0..1) blends the two signals.
+    /// Falls back to pure keyword when `query_vec` is empty.
+    pub fn hybrid_search(
+        &self,
+        query: &str,
+        query_vec: &[f32],
+        opts: &QueryOptions,
+        semantic_weight: f32,
+    ) -> Vec<SearchResult> {
+        self.resolve(query::hybrid_search(
+            &self.index,
+            query,
+            query_vec,
+            opts,
+            semantic_weight,
+        ))
+    }
+
+    /// Whether the index carries semantic embeddings (built with `--semantic`).
+    pub fn has_embeddings(&self) -> bool {
+        self.index.has_embeddings()
+    }
+
+    /// Live `(doc_id, path)` pairs that don't yet have an embedding — the work
+    /// list for building semantic vectors.
+    pub fn docs_needing_embedding(&self) -> Vec<(u32, PathBuf)> {
+        self.index
+            .docs
+            .iter()
+            .flatten()
+            .filter(|m| m.embedding.is_none())
+            .map(|m| (m.id, m.path.clone()))
+            .collect()
+    }
+
+    /// Attach a (unit-normalized) embedding to a document.
+    pub fn set_embedding(&mut self, doc_id: u32, embedding: Vec<f32>) {
+        self.index.set_embedding(doc_id, embedding);
+    }
+
+    /// Resolve ranked hits into full results by joining document metadata.
+    fn resolve(&self, hits: Vec<query::Hit>) -> Vec<SearchResult> {
+        hits.into_iter()
             .filter_map(|hit| {
                 self.index.doc(hit.doc_id).map(|m| SearchResult {
                     doc_id: hit.doc_id,

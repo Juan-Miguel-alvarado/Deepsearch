@@ -99,6 +99,13 @@ pub struct App {
     /// Receives the one-shot startup probe of Ollama availability.
     ai_probe: Option<Receiver<bool>>,
 
+    /// Whether the index carries semantic embeddings (built with `--semantic`).
+    has_embeddings: bool,
+    /// In-flight query embedding for semantic re-ranking, tagged with the
+    /// generation it belongs to so stale replies are dropped.
+    embed_rx: Option<Receiver<(u64, Vec<f32>)>>,
+    embed_gen: u64,
+
     dirty: bool,
     last_edit: Instant,
     status: String,
@@ -107,6 +114,7 @@ pub struct App {
 impl App {
     pub fn new(ds: DeepSearch, opts: QueryOptions) -> Self {
         let n = ds.len();
+        let has_embeddings = ds.has_embeddings();
         // Probe Ollama once, off-thread, so startup never blocks on it. The
         // result lights up the "ask AI" hint if a local server is reachable.
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
@@ -132,6 +140,9 @@ impl App {
             ai_rx: None,
             ai_available: false,
             ai_probe: Some(probe_rx),
+            has_embeddings,
+            embed_rx: None,
+            embed_gen: 0,
             dirty: false,
             last_edit: Instant::now(),
             status: format!("{n} documents indexed — start typing to search"),
@@ -368,6 +379,16 @@ impl App {
             }
         }
 
+        // Pick up a finished query embedding and re-rank with semantics.
+        if let Some(rx) = self.embed_rx.as_ref() {
+            if let Ok((gen, vec)) = rx.try_recv() {
+                self.embed_rx = None;
+                if gen == self.embed_gen && !self.input.trim().is_empty() {
+                    self.apply_semantic(&vec);
+                }
+            }
+        }
+
         let Some(rx) = self.ai_rx.as_ref() else {
             return;
         };
@@ -422,6 +443,55 @@ impl App {
             self.list_state.select(Some(0));
             self.request_preview();
         }
+        // Kick off semantic re-ranking in the background; keyword results are
+        // already on screen and get refined when the embedding arrives.
+        self.request_semantic();
+    }
+
+    /// If the index has embeddings and Ollama is reachable, embed the current
+    /// query off-thread. The reply (tagged with a generation) is applied by
+    /// [`Self::drain_ai`] via [`Self::hybrid_search`], replacing the keyword
+    /// results with meaning-aware ones.
+    fn request_semantic(&mut self) {
+        if !self.has_embeddings || !self.ai_available {
+            return;
+        }
+        let query = self.input.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        self.embed_gen += 1;
+        let gen = self.embed_gen;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.embed_rx = Some(rx);
+        std::thread::spawn(move || {
+            if let Ok(vec) = crate::ai::embed(&query, true) {
+                let _ = tx.send((gen, vec));
+            }
+        });
+    }
+
+    /// Re-rank the current query with hybrid keyword+semantic scoring using the
+    /// freshly computed query embedding, keeping the selection on the same file
+    /// when possible.
+    fn apply_semantic(&mut self, query_vec: &[f32]) {
+        let keep = self.selected().map(|r| r.doc_id);
+        self.results =
+            self.ds
+                .hybrid_search(&self.input, query_vec, &self.opts, crate::SEMANTIC_WEIGHT);
+        if self.results.is_empty() {
+            self.list_state.select(None);
+            self.preview = Preview::Loading;
+            self.showing_image = false;
+            return;
+        }
+        // Try to keep the same file selected; otherwise jump to the top.
+        let idx = keep
+            .and_then(|id| self.results.iter().position(|r| r.doc_id == id))
+            .unwrap_or(0);
+        self.list_state.select(Some(idx));
+        self.status = format!("{} results · semantic", self.results.len());
+        self.request_preview();
     }
 
     fn selected(&self) -> Option<&SearchResult> {
@@ -726,6 +796,13 @@ impl App {
             None
         };
         let mut title = vec![Span::raw(" deepsearch "), mode_tag];
+        if self.has_embeddings && self.ai_available {
+            title.push(Span::raw(" "));
+            title.push(Span::styled(
+                " semantic ",
+                Style::default().bg(Color::Green).fg(Color::Black),
+            ));
+        }
         if let Some(tag) = ai_tag {
             title.push(Span::raw(" "));
             title.push(tag);

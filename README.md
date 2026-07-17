@@ -13,8 +13,9 @@ with `type:`/`ext:` filters — live, syntax-highlighted previews (and image
 previews via the terminal graphics protocol), an **open-with** menu that
 launches the selected file in whatever app you have installed (editor, image/PDF
 viewer, media player, or the OS default), one-key **copy-path**, and optional
-**natural-language search** via a local [Ollama](https://ollama.com) model
-(free, offline, no API keys).
+AI features via a local [Ollama](https://ollama.com) model (free, offline, no API
+keys): **natural-language queries** and **semantic search** that finds files by
+meaning, not just keywords.
 
 ```
 deepsearch index ~/projects      # scan & index once (incremental afterwards)
@@ -274,8 +275,10 @@ an error and skipped; the index build continues.
 deepsearch index [PATH]            Build the index (PATH defaults to $HOME).
 deepsearch index [PATH] --incremental
                                    Reindex only changed files; drop deleted ones.
+deepsearch index [PATH] --semantic Also build semantic embeddings (see below).
 deepsearch query "<words>"         Ranked results (name + content).
         --limit N                  Cap results (default 20).
+        --keyword                  Force keyword-only (skip semantic).
         --json                     Machine-readable output.
 deepsearch ask "<plain text>"      Natural-language search (needs local Ollama).
 deepsearch tui [PATH]              Interactive UI (indexes PATH first if empty).
@@ -305,6 +308,35 @@ It's entirely optional: with no Ollama installed, `ask` prints a friendly hint
 and everything else works exactly the same. deepsearch uses the first model
 Ollama has (or set `DEEPSEARCH_OLLAMA_MODEL=llama3.2`); point at a non-default
 server with `OLLAMA_HOST`.
+
+### Semantic search (search by meaning)
+
+Keyword search only finds the words you type. **Semantic search** finds files by
+*meaning*, so a search for `login` surfaces a document about "authentication,
+credentials and session tokens" even though it never contains the word "login".
+
+Build it once (needs a local embedding model — free, offline):
+
+```bash
+ollama pull nomic-embed-text
+deepsearch index --semantic          # embeds every document (a one-time pass)
+```
+
+After that it just works:
+
+- `deepsearch query "login"` automatically blends keyword + semantic ranking
+  (add `--keyword` to force the old behaviour).
+- In the **TUI**, keyword results appear instantly and are re-ranked by meaning a
+  moment later; a green **`semantic`** tag in the search box shows it's active.
+
+How it works: each document is embedded into a vector with the local model; a
+query is embedded the same way and scored by cosine similarity, then blended with
+BM25 (`(1 − w)·keyword + w·semantic`, `w = 0.5`). Everything runs locally through
+Ollama — nothing leaves the machine. Pick a different embedding model with
+`DEEPSEARCH_OLLAMA_EMBED_MODEL`.
+
+> **Note:** enabling embeddings bumps the on-disk index format. After upgrading,
+> run `deepsearch index` again to rebuild the cache.
 
 ### Search filters
 
