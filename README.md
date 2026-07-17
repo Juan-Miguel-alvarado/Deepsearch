@@ -21,6 +21,12 @@ deepsearch tui                   # interactive fuzzy search
 
 <img width="1352" height="718" alt="image" src="https://github.com/user-attachments/assets/81edafd6-d82f-406a-98d0-77a58a76a175" />
 
+
+
+https://github.com/user-attachments/assets/f68476ca-0f2e-4101-a1b6-f9b6e720894e
+
+
+
 ---
 
 ## Quickstart
