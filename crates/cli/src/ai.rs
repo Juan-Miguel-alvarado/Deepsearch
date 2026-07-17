@@ -40,7 +40,9 @@ fn quick_agent() -> ureq::Agent {
 fn gen_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_millis(800))
-        .timeout(Duration::from_secs(60))
+        // Generous: the very first request also loads the model into memory,
+        // which can take a while on a cold/busy machine.
+        .timeout(Duration::from_secs(120))
         .build()
 }
 
@@ -90,28 +92,31 @@ fn pick_model() -> Result<String, String> {
 /// The instruction we give the model. It must answer with a single query line.
 fn build_prompt(request: &str) -> String {
     format!(
-        "You convert a user's natural-language file-search request into a query \
-for a tool called `deepsearch`. Reply with ONLY the query line — no quotes, no \
-code fences, no explanation.\n\
+        "You turn a user's natural-language file-search request into a one-line \
+query for a tool called `deepsearch`. Output ONLY the query — no quotes, no code \
+fences, no explanation.\n\
 \n\
-Query syntax:\n\
-- plain words: matched against file names and contents (use meaningful keywords)\n\
-- type:image | type:pdf | type:code | type:text | type:docx | type:binary  (filter by kind)\n\
-- ext:rs ext:png ...  (filter by file extension; repeatable)\n\
+Pieces you may use:\n\
+- keywords: words that should appear in the file name or contents\n\
+- a type filter, ONLY one of exactly: type:image type:pdf type:docx type:text type:binary\n\
+- ext:<extension>  (e.g. ext:rs, ext:png; repeatable)\n\
 \n\
-Rules: keep it short; prefer English keywords; only add a type:/ext: filter if \
-the request clearly implies one; if the request is already keywords, return them \
-as-is.\n\
+Rules:\n\
+- Use ONLY words from the user's request. NEVER invent words, and never copy \
+words from the examples below.\n\
+- Add a type:/ext: filter only when the request clearly implies a file kind or \
+extension.\n\
+- `type:` must be one of the five values listed above. For a programming \
+language use its extension instead (rust->ext:rs, python->ext:py, \
+javascript->ext:js, go->ext:go) — never write type:rust or type:code.\n\
+- If the request names only a kind of file with no topic, output just the filter \
+(e.g. `type:image`).\n\
+- Keep it short; translate the keywords to English.\n\
 \n\
-Examples:\n\
-Request: rust files about parsing\n\
-Query: parsing ext:rs\n\
-Request: screenshots and photos\n\
-Query: type:image\n\
-Request: that invoice pdf from acme\n\
-Query: invoice acme type:pdf\n\
-Request: my notes on the database migration\n\
-Query: database migration notes\n\
+Examples (patterns only — do NOT reuse their words):\n\
+\"todas mis fotos\" -> type:image\n\
+\"el contrato en pdf\" -> contract type:pdf\n\
+\"scripts de backup en python\" -> backup ext:py\n\
 \n\
 Request: {request}\n\
 Query:"

@@ -238,8 +238,11 @@ pub fn parse_filters(query: &str) -> (String, Filters) {
                 filters.exts.push(v);
             }
         } else if let Some(v) = strip_prefix_ci(tok, "type:") {
-            if let Some(ft) = parse_file_type(&v.to_ascii_lowercase()) {
-                filters.types.push(ft);
+            match parse_file_type(&v.to_ascii_lowercase()) {
+                Some(ft) => filters.types.push(ft),
+                // Unknown kind (e.g. a model guessing `type:rust`): don't drop it
+                // silently — fall back to treating the value as a search keyword.
+                None => terms.push(v),
             }
         } else {
             terms.push(tok);
@@ -259,8 +262,10 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 
 fn parse_file_type(v: &str) -> Option<FileType> {
     Some(match v {
-        "text" | "txt" | "plain" => FileType::Text,
-        "code" | "source" => FileType::Code,
+        // Source code is indexed as text (the extractor never emits `Code`), so
+        // `type:code` and `type:text` both resolve to the text bucket — combine
+        // with `ext:` to narrow to a language.
+        "text" | "txt" | "plain" | "code" | "source" => FileType::Text,
         "pdf" => FileType::Pdf,
         "docx" | "doc" | "word" => FileType::Docx,
         "image" | "img" | "picture" => FileType::Image,
@@ -547,6 +552,29 @@ mod tests {
         assert_eq!(clean, "parser");
         assert_eq!(f.exts, vec!["rs".to_string()]);
         assert_eq!(f.types, vec![FileType::Image]);
+    }
+
+    #[test]
+    fn unknown_type_becomes_a_keyword() {
+        // An invalid `type:` (e.g. a model guessing) is kept as a search term
+        // rather than silently dropped, so the query never comes out empty.
+        let (clean, f) = parse_filters("type:rust");
+        assert_eq!(clean, "rust");
+        assert!(f.types.is_empty());
+    }
+
+    #[test]
+    fn type_code_matches_text() {
+        // Source is indexed as text, so `type:code` resolves to the text bucket.
+        let mut idx = Index::new();
+        doc(
+            &mut idx,
+            "/main.rs",
+            &[("code", 1)],
+            &[("main", 1), ("rs", 1)],
+        );
+        let hits = search(&idx, "type:code", &QueryOptions::default());
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]
