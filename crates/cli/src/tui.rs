@@ -32,30 +32,45 @@ use deepsearch_core::{DeepSearch, QueryOptions, SearchResult};
 use crate::open::{candidates_for, AppKind, OpenApp};
 use crate::preview::{Preview, PreviewRequest, PreviewWorker};
 
-/// A single muted palette drives the whole UI: dim chrome, one accent for focus,
-/// and a couple of semantic colours. Keeping it in one place is what makes the
-/// panes read as one design rather than a pile of widgets.
+/// The UI borrows the terminal's own palette instead of imposing one.
+///
+/// Colours are the **ANSI slots**, not fixed RGB: the terminal maps them to
+/// whatever theme is active, so deepsearch matches the desktop (on Omarchy, the
+/// theme that sets your wallpaper also rewrites the terminal palette) and stays
+/// readable on light and dark backgrounds alike.
+///
+/// Secondary text is the default foreground with the *dim* attribute rather than
+/// a grey: many themes make "bright black" nearly invisible against their
+/// background, and a faded foreground degrades gracefully everywhere.
 mod theme {
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Modifier, Style};
 
     /// Primary accent: focus, selection, headings.
-    pub const ACCENT: Color = Color::Rgb(122, 162, 247);
+    pub const ACCENT: Color = Color::Cyan;
     /// Secondary accent, used for the AI affordances.
-    pub const VIOLET: Color = Color::Rgb(187, 154, 247);
+    pub const ALT: Color = Color::Magenta;
     /// Positive state (semantic search active).
-    pub const GREEN: Color = Color::Rgb(158, 206, 106);
+    pub const OK: Color = Color::Green;
     /// In-progress / attention.
-    pub const AMBER: Color = Color::Rgb(224, 175, 104);
+    pub const WARN: Color = Color::Yellow;
     /// Errors.
-    pub const RED: Color = Color::Rgb(247, 118, 142);
-    /// Body text.
-    pub const FG: Color = Color::Rgb(192, 202, 245);
-    /// Secondary text: paths, hints, labels.
-    pub const DIM: Color = Color::Rgb(105, 114, 156);
-    /// Panel outlines when unfocused.
-    pub const BORDER: Color = Color::Rgb(59, 66, 97);
-    /// Selected row background.
-    pub const SEL_BG: Color = Color::Rgb(41, 46, 66);
+    pub const ERR: Color = Color::Red;
+
+    /// Body text: the terminal's own foreground.
+    pub fn body() -> Style {
+        Style::default().fg(Color::Reset)
+    }
+
+    /// Secondary text — paths, labels, hints, and unfocused panel outlines.
+    pub fn dim() -> Style {
+        Style::default().add_modifier(Modifier::DIM)
+    }
+
+    /// The selected row. No background fill: a coloured bar plus bold text reads
+    /// clearly on any palette, whereas a fixed highlight colour does not.
+    pub fn selected() -> Style {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    }
 }
 
 /// A rounded, dim-bordered panel with a little breathing room — the base for
@@ -64,18 +79,18 @@ fn panel(title: Line<'_>, focused: bool) -> Block<'_> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if focused {
-            theme::ACCENT
+        .border_style(if focused {
+            Style::default().fg(theme::ACCENT)
         } else {
-            theme::BORDER
-        }))
+            theme::dim()
+        })
         .padding(Padding::horizontal(1))
         .title(title)
 }
 
 /// A dim `·` used to separate title badges and footer hints.
 fn sep() -> Span<'static> {
-    Span::styled(" · ", Style::default().fg(theme::BORDER))
+    Span::styled(" · ", theme::dim())
 }
 
 /// Render a directory for display, collapsing the home directory to `~`. Keeps
@@ -783,7 +798,7 @@ impl App {
                     "   ".to_string()
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(num, Style::default().fg(theme::BORDER)),
+                    Span::styled(num, theme::dim()),
                     Span::raw(" "),
                     Span::styled(a.label.clone(), Style::default().fg(kind_color(a.kind))),
                 ]))
@@ -807,23 +822,19 @@ impl App {
                         .fg(theme::ACCENT)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(filename, Style::default().fg(theme::FG)),
+                Span::styled(filename, theme::body()),
                 Span::raw(" "),
             ]),
             true,
         )
         .title_bottom(Line::from(Span::styled(
             " 1-9 open · ↑↓ move · ⏎ · esc ",
-            Style::default().fg(theme::BORDER),
+            theme::dim(),
         )));
 
         let list = List::new(items)
             .block(block)
-            .highlight_style(
-                Style::default()
-                    .bg(theme::SEL_BG)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .highlight_style(theme::selected())
             .highlight_symbol("▌");
 
         frame.render_widget(Clear, area);
@@ -841,7 +852,7 @@ impl App {
         )];
 
         let (mode_label, mode_color) = match self.mode {
-            Mode::Insert => ("INSERT", theme::GREEN),
+            Mode::Insert => ("INSERT", theme::OK),
             Mode::Normal => ("NORMAL", theme::ACCENT),
         };
         title.push(sep());
@@ -849,20 +860,14 @@ impl App {
 
         if self.has_embeddings && self.ai_available {
             title.push(sep());
-            title.push(Span::styled(
-                "● semantic",
-                Style::default().fg(theme::GREEN),
-            ));
+            title.push(Span::styled("● semantic", Style::default().fg(theme::OK)));
         }
         if self.ai_rx.is_some() {
             title.push(sep());
-            title.push(Span::styled("◌ asking…", Style::default().fg(theme::AMBER)));
+            title.push(Span::styled("◌ asking…", Style::default().fg(theme::WARN)));
         } else if self.ai_available {
             title.push(sep());
-            title.push(Span::styled(
-                "⌃A ask AI",
-                Style::default().fg(theme::VIOLET),
-            ));
+            title.push(Span::styled("⌃A ask AI", Style::default().fg(theme::ALT)));
         }
         title.push(Span::raw(" "));
 
@@ -874,7 +879,7 @@ impl App {
                     .fg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(&self.input, Style::default().fg(theme::FG)),
+            Span::styled(&self.input, theme::body()),
         ]);
         frame.render_widget(
             Paragraph::new(text).block(panel(Line::from(title), focused)),
@@ -904,32 +909,21 @@ impl App {
                     .unwrap_or_default();
                 let parent = r.path.parent().map(pretty_dir).unwrap_or_default();
                 ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{:<4}", type_tag(r.file_type)),
-                        Style::default().fg(theme::DIM),
-                    ),
-                    Span::styled(name, Style::default().fg(theme::FG)),
-                    Span::styled(format!("  {parent}"), Style::default().fg(theme::DIM)),
+                    Span::styled(format!("{:<4}", type_tag(r.file_type)), theme::dim()),
+                    Span::styled(name, theme::body()),
+                    Span::styled(format!("  {parent}"), theme::dim()),
                 ]))
             })
             .collect();
 
         let title = Line::from(vec![
-            Span::styled(" Results ", Style::default().fg(theme::DIM)),
-            Span::styled(
-                format!("{} ", self.results.len()),
-                Style::default().fg(theme::BORDER),
-            ),
+            Span::styled(" Results ", theme::dim()),
+            Span::styled(format!("{} ", self.results.len()), theme::dim()),
         ]);
         let focused = self.mode == Mode::Normal;
         let list = List::new(items)
             .block(panel(title, focused))
-            .highlight_style(
-                Style::default()
-                    .bg(theme::SEL_BG)
-                    .fg(theme::ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .highlight_style(theme::selected())
             .highlight_symbol("▌ ");
         frame.render_stateful_widget(list, area, &mut self.list_state);
     }
@@ -951,10 +945,10 @@ impl App {
                             .fg(theme::ACCENT)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(format!("{parent} "), Style::default().fg(theme::DIM)),
+                    Span::styled(format!("{parent} "), theme::dim()),
                 ])
             }
-            None => Line::from(Span::styled(" Preview ", Style::default().fg(theme::DIM))),
+            None => Line::from(Span::styled(" Preview ", theme::dim())),
         };
         let block = panel(title, false);
         let inner = block.inner(area);
@@ -969,13 +963,10 @@ impl App {
 
         let text: Text = match &self.preview {
             Preview::Text(t) | Preview::Meta(t) => t.clone(),
-            Preview::Loading => Text::from(Line::from(Span::styled(
-                "…",
-                Style::default().fg(theme::DIM),
-            ))),
+            Preview::Loading => Text::from(Line::from(Span::styled("…", theme::dim()))),
             Preview::Error(e) => Text::from(Line::from(Span::styled(
                 e.clone(),
-                Style::default().fg(theme::RED),
+                Style::default().fg(theme::ERR),
             ))),
             // Image handled above; if we get here the picker failed.
             Preview::Image(_) => Text::from("image"),
@@ -991,14 +982,11 @@ impl App {
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(area);
 
-        let status = Line::from(Span::styled(
-            format!(" {}", self.status),
-            Style::default().fg(theme::DIM),
-        ));
+        let status = Line::from(Span::styled(format!(" {}", self.status), theme::dim()));
         frame.render_widget(Paragraph::new(status), cols[0]);
 
         let key = Style::default().fg(theme::ACCENT);
-        let label = Style::default().fg(theme::DIM);
+        let label = theme::dim();
         let mut hints: Vec<Span> = Vec::new();
         for (i, (k, l)) in [
             ("↑↓", "move"),
@@ -1028,11 +1016,11 @@ impl App {
 fn kind_color(kind: AppKind) -> Color {
     match kind {
         AppKind::Editor => theme::ACCENT,
-        AppKind::Image => theme::GREEN,
-        AppKind::Pdf => theme::RED,
-        AppKind::Media => theme::VIOLET,
-        AppKind::Default => theme::AMBER,
-        AppKind::Reveal | AppKind::Terminal => theme::DIM,
+        AppKind::Image => theme::OK,
+        AppKind::Pdf => theme::ERR,
+        AppKind::Media => theme::ALT,
+        AppKind::Default => theme::WARN,
+        AppKind::Reveal | AppKind::Terminal => Color::Reset,
     }
 }
 
@@ -1060,7 +1048,7 @@ fn render_help(frame: &mut Frame) {
         .map(|(key, desc)| {
             Line::from(vec![
                 Span::styled(format!("{key:<26}"), Style::default().fg(theme::ACCENT)),
-                Span::styled(*desc, Style::default().fg(theme::DIM)),
+                Span::styled(*desc, theme::dim()),
             ])
         })
         .collect();
@@ -1076,10 +1064,7 @@ fn render_help(frame: &mut Frame) {
         )),
         true,
     )
-    .title_bottom(Line::from(Span::styled(
-        " any key to close ",
-        Style::default().fg(theme::BORDER),
-    )));
+    .title_bottom(Line::from(Span::styled(" any key to close ", theme::dim())));
 
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -1203,6 +1188,33 @@ mod tests {
         println!("\n{out}\n");
         assert!(out.contains("semantic"), "semantic badge");
         assert!(out.contains("ask AI"), "ask-AI badge");
+    }
+
+    #[test]
+    fn uses_only_the_terminal_palette() {
+        // deepsearch must not impose colours of its own: a hardcoded RGB value
+        // ignores the user's theme (and, on Omarchy, their wallpaper). Every
+        // cell should use an ANSI slot or the terminal default.
+        let mut app = demo_app();
+        app.ai_available = true;
+        app.has_embeddings = true;
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                for (what, color) in [("fg", cell.fg), ("bg", cell.bg)] {
+                    assert!(
+                        !matches!(color, Color::Rgb(..) | Color::Indexed(..)),
+                        "cell ({x},{y}) {what} is a fixed colour ({color:?}); \
+                         use an ANSI slot so the terminal theme drives it",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
