@@ -1,6 +1,8 @@
 # deepsearch
 
-[![CI](https://github.com/Juan-Miguel-alvarado/Deepsearch/actions/workflows/ci.yml/badge.svg)](https://github.com/Juan-Miguel-alvarado/Deepsearch/actions/workflows/ci.yml)
+<img width="1346" height="710" alt="image" src="https://github.com/user-attachments/assets/84cb6309-8720-446c-acd9-125265ace9cb" />
+
+
 [![Release](https://img.shields.io/github/v/release/Juan-Miguel-alvarado/Deepsearch?sort=semver)](https://github.com/Juan-Miguel-alvarado/Deepsearch/releases/latest)
 
 Relevance-ranked full-text search over **all** your files, from the terminal.
