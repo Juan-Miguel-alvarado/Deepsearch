@@ -54,8 +54,16 @@ pub fn available() -> bool {
         .is_ok()
 }
 
-/// Names of the models installed in the local Ollama.
-fn installed_models() -> Result<Vec<String>, String> {
+/// A model installed in Ollama, with the capabilities it advertises.
+struct ModelInfo {
+    name: String,
+    /// e.g. `["completion", "tools"]` or `["embedding"]`. Empty on older Ollama
+    /// versions that don't report capabilities.
+    capabilities: Vec<String>,
+}
+
+/// The models installed in the local Ollama.
+fn installed_models() -> Result<Vec<ModelInfo>, String> {
     let resp = quick_agent()
         .get(&format!("{}/api/tags", host()))
         .call()
@@ -68,15 +76,48 @@ fn installed_models() -> Result<Vec<String>, String> {
         .and_then(|m| m.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(String::from))
+                .filter_map(|m| {
+                    let name = m.get("name").and_then(|n| n.as_str())?.to_string();
+                    let capabilities = m
+                        .get("capabilities")
+                        .and_then(|c| c.as_array())
+                        .map(|c| {
+                            c.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some(ModelInfo { name, capabilities })
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     Ok(models)
 }
 
+/// Pick a model that can actually *generate text*.
+///
+/// Ollama lists embedding-only models (e.g. `nomic-embed-text`) alongside chat
+/// models, and they reject `/api/generate` with a 400 — so naively taking the
+/// first installed model breaks as soon as an embedding model is pulled.
+fn choose_completion_model(models: &[ModelInfo]) -> Option<String> {
+    // Prefer a model that explicitly advertises completion.
+    if let Some(m) = models
+        .iter()
+        .find(|m| m.capabilities.iter().any(|c| c == "completion"))
+    {
+        return Some(m.name.clone());
+    }
+    // Older Ollama doesn't report capabilities: fall back to skipping anything
+    // that looks like an embedding model.
+    models
+        .iter()
+        .find(|m| m.capabilities.is_empty() && !m.name.to_ascii_lowercase().contains("embed"))
+        .map(|m| m.name.clone())
+}
+
 /// Choose which model to use: `DEEPSEARCH_OLLAMA_MODEL` if set, else the first
-/// model installed locally.
+/// locally installed model that can generate text.
 fn pick_model() -> Result<String, String> {
     if let Ok(m) = std::env::var("DEEPSEARCH_OLLAMA_MODEL") {
         if !m.trim().is_empty() {
@@ -84,8 +125,10 @@ fn pick_model() -> Result<String, String> {
         }
     }
     let models = installed_models()?;
-    models.into_iter().next().ok_or_else(|| {
-        "Ollama is running but has no models. Pull one, e.g. `ollama pull llama3.2`.".to_string()
+    choose_completion_model(&models).ok_or_else(|| {
+        "Ollama has no text-generation model installed (only embedding models). \
+Pull one, e.g. `ollama pull llama3.2`."
+            .to_string()
     })
 }
 
@@ -109,8 +152,11 @@ extension.\n\
 - `type:` must be one of the five values listed above. For a programming \
 language use its extension instead (rust->ext:rs, python->ext:py, \
 javascript->ext:js, go->ext:go) — never write type:rust or type:code.\n\
-- If the request names only a kind of file with no topic, output just the filter \
-(e.g. `type:image`).\n\
+- ALWAYS include the topic keywords. Never answer with a filter alone unless the \
+request names only a kind of file and no topic at all (e.g. \"all my photos\" -> \
+type:image).\n\
+- NEVER answer with just `type:text` — it matches almost every file and is \
+useless on its own.\n\
 - Keep it short; translate the keywords to English.\n\
 \n\
 Examples (patterns only — do NOT reuse their words):\n\
@@ -171,7 +217,7 @@ pub fn embed_available() -> bool {
     installed_models()
         .map(|ms| {
             ms.iter()
-                .any(|m| m == &want || m.split(':').next() == Some(want.as_str()))
+                .any(|m| m.name == want || m.name.split(':').next() == Some(want.as_str()))
         })
         .unwrap_or(false)
 }
@@ -290,5 +336,46 @@ mod tests {
     #[test]
     fn sanitize_empty() {
         assert_eq!(sanitize("\n\n  \n"), "");
+    }
+
+    fn model(name: &str, caps: &[&str]) -> ModelInfo {
+        ModelInfo {
+            name: name.to_string(),
+            capabilities: caps.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn skips_embedding_only_models() {
+        // Ollama lists embedding models first here; picking one for /api/generate
+        // is a 400, so the completion-capable model must win.
+        let models = [
+            model("nomic-embed-text:latest", &["embedding"]),
+            model("llama3.2:latest", &["completion", "tools"]),
+        ];
+        assert_eq!(
+            choose_completion_model(&models).as_deref(),
+            Some("llama3.2:latest")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_name_when_capabilities_missing() {
+        // Older Ollama reports no capabilities: skip anything named like an
+        // embedding model.
+        let models = [
+            model("nomic-embed-text:latest", &[]),
+            model("mistral:latest", &[]),
+        ];
+        assert_eq!(
+            choose_completion_model(&models).as_deref(),
+            Some("mistral:latest")
+        );
+    }
+
+    #[test]
+    fn no_completion_model_available() {
+        let models = [model("nomic-embed-text:latest", &["embedding"])];
+        assert!(choose_completion_model(&models).is_none());
     }
 }
