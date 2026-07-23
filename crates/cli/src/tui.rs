@@ -15,10 +15,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+};
 use ratatui::{DefaultTerminal, Frame};
 
 use ratatui_image::picker::Picker;
@@ -29,6 +31,67 @@ use deepsearch_core::{DeepSearch, QueryOptions, SearchResult};
 
 use crate::open::{candidates_for, AppKind, OpenApp};
 use crate::preview::{Preview, PreviewRequest, PreviewWorker};
+
+/// A single muted palette drives the whole UI: dim chrome, one accent for focus,
+/// and a couple of semantic colours. Keeping it in one place is what makes the
+/// panes read as one design rather than a pile of widgets.
+mod theme {
+    use ratatui::style::Color;
+
+    /// Primary accent: focus, selection, headings.
+    pub const ACCENT: Color = Color::Rgb(122, 162, 247);
+    /// Secondary accent, used for the AI affordances.
+    pub const VIOLET: Color = Color::Rgb(187, 154, 247);
+    /// Positive state (semantic search active).
+    pub const GREEN: Color = Color::Rgb(158, 206, 106);
+    /// In-progress / attention.
+    pub const AMBER: Color = Color::Rgb(224, 175, 104);
+    /// Errors.
+    pub const RED: Color = Color::Rgb(247, 118, 142);
+    /// Body text.
+    pub const FG: Color = Color::Rgb(192, 202, 245);
+    /// Secondary text: paths, hints, labels.
+    pub const DIM: Color = Color::Rgb(105, 114, 156);
+    /// Panel outlines when unfocused.
+    pub const BORDER: Color = Color::Rgb(59, 66, 97);
+    /// Selected row background.
+    pub const SEL_BG: Color = Color::Rgb(41, 46, 66);
+}
+
+/// A rounded, dim-bordered panel with a little breathing room — the base for
+/// every pane so they look like one system.
+fn panel(title: Line<'_>, focused: bool) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if focused {
+            theme::ACCENT
+        } else {
+            theme::BORDER
+        }))
+        .padding(Padding::horizontal(1))
+        .title(title)
+}
+
+/// A dim `·` used to separate title badges and footer hints.
+fn sep() -> Span<'static> {
+    Span::styled(" · ", Style::default().fg(theme::BORDER))
+}
+
+/// Render a directory for display, collapsing the home directory to `~`. Keeps
+/// the narrow results pane readable instead of burning half of it on `/home/you`.
+fn pretty_dir(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy();
+        if !home.is_empty() {
+            if let Some(rest) = s.strip_prefix(home.as_ref()) {
+                return format!("~{rest}");
+            }
+        }
+    }
+    s.into_owned()
+}
 
 /// How long the query must be idle before we run the search.
 const DEBOUNCE: Duration = Duration::from_millis(120);
@@ -720,20 +783,9 @@ impl App {
                     "   ".to_string()
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(
-                        num,
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(
-                        a.label.clone(),
-                        Style::default()
-                            .fg(kind_color(a.kind))
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(num, Style::default().fg(theme::BORDER)),
+                    Span::raw(" "),
+                    Span::styled(a.label.clone(), Style::default().fg(kind_color(a.kind))),
                 ]))
             })
             .collect();
@@ -747,79 +799,87 @@ impl App {
             frame.area(),
         );
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(Line::from(vec![
-                Span::styled(" Open ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(filename, Style::default().fg(Color::Yellow)),
+        let block = panel(
+            Line::from(vec![
+                Span::styled(
+                    " Open ",
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(filename, Style::default().fg(theme::FG)),
                 Span::raw(" "),
-            ]))
-            .title_bottom(Line::from(Span::styled(
-                " 1-9 open · ↑/↓ move · Enter · Esc ",
-                Style::default().fg(Color::DarkGray),
-            )));
+            ]),
+            true,
+        )
+        .title_bottom(Line::from(Span::styled(
+            " 1-9 open · ↑↓ move · ⏎ · esc ",
+            Style::default().fg(theme::BORDER),
+        )));
 
         let list = List::new(items)
             .block(block)
-            .highlight_style(Style::default().bg(Color::DarkGray))
-            .highlight_symbol("▶ ");
+            .highlight_style(
+                Style::default()
+                    .bg(theme::SEL_BG)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▌");
 
         frame.render_widget(Clear, area);
         frame.render_stateful_widget(list, area, &mut menu.state);
     }
 
     fn render_query(&self, frame: &mut Frame, area: Rect) {
-        let mode_tag = match self.mode {
-            Mode::Insert => Span::styled(
-                " INSERT ",
-                Style::default().bg(Color::Green).fg(Color::Black),
-            ),
-            Mode::Normal => Span::styled(
-                " NORMAL ",
-                Style::default().bg(Color::Blue).fg(Color::White),
-            ),
+        // Badges are dim text with a coloured marker rather than filled blocks:
+        // they inform without shouting over the query itself.
+        let mut title = vec![Span::styled(
+            " deepsearch",
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )];
+
+        let (mode_label, mode_color) = match self.mode {
+            Mode::Insert => ("INSERT", theme::GREEN),
+            Mode::Normal => ("NORMAL", theme::ACCENT),
         };
-        // Advertise the "ask AI" shortcut only when a local Ollama was found, so
-        // the feature is discoverable without cluttering the UI when it's off.
-        let ai_tag = if self.ai_rx.is_some() {
-            Some(Span::styled(
-                " ⌃A asking… ",
-                Style::default().bg(Color::Yellow).fg(Color::Black),
-            ))
-        } else if self.ai_available {
-            Some(Span::styled(
-                " ⌃A ask AI ",
-                Style::default().bg(Color::Magenta).fg(Color::White),
-            ))
-        } else {
-            None
-        };
-        let mut title = vec![Span::raw(" deepsearch "), mode_tag];
+        title.push(sep());
+        title.push(Span::styled(mode_label, Style::default().fg(mode_color)));
+
         if self.has_embeddings && self.ai_available {
-            title.push(Span::raw(" "));
+            title.push(sep());
             title.push(Span::styled(
-                " semantic ",
-                Style::default().bg(Color::Green).fg(Color::Black),
+                "● semantic",
+                Style::default().fg(theme::GREEN),
             ));
         }
-        if let Some(tag) = ai_tag {
-            title.push(Span::raw(" "));
-            title.push(tag);
+        if self.ai_rx.is_some() {
+            title.push(sep());
+            title.push(Span::styled("◌ asking…", Style::default().fg(theme::AMBER)));
+        } else if self.ai_available {
+            title.push(sep());
+            title.push(Span::styled(
+                "⌃A ask AI",
+                Style::default().fg(theme::VIOLET),
+            ));
         }
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(title));
+        title.push(Span::raw(" "));
+
+        let focused = self.mode == Mode::Insert;
         let text = Line::from(vec![
             Span::styled(
                 "❯ ",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(&self.input),
+            Span::styled(&self.input, Style::default().fg(theme::FG)),
         ]);
-        frame.render_widget(Paragraph::new(text).block(block), area);
+        frame.render_widget(
+            Paragraph::new(text).block(panel(Line::from(title), focused)),
+            area,
+        );
 
         if self.mode == Mode::Insert && area.width > 2 {
             // Place the cursor right after the prompt + current input, clamped
@@ -831,6 +891,8 @@ impl App {
     }
 
     fn render_results(&mut self, frame: &mut Frame, area: Rect) {
+        // The filename is what you scan for, so it leads; the kind and the
+        // directory are context and stay dim. The score is noise — it's gone.
         let items: Vec<ListItem> = self
             .results
             .iter()
@@ -840,45 +902,61 @@ impl App {
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                let parent = r
-                    .path
-                    .parent()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let line = Line::from(vec![
+                let parent = r.path.parent().map(pretty_dir).unwrap_or_default();
+                ListItem::new(Line::from(vec![
                     Span::styled(
-                        format!("{:>6.2} ", r.score),
-                        Style::default().fg(Color::Yellow),
+                        format!("{:<4}", type_tag(r.file_type)),
+                        Style::default().fg(theme::DIM),
                     ),
-                    Span::styled(
-                        format!("[{}] ", type_tag(r.file_type)),
-                        Style::default().fg(Color::Magenta),
-                    ),
-                    Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("  {parent}"), Style::default().fg(Color::DarkGray)),
-                ]);
-                ListItem::new(line)
+                    Span::styled(name, Style::default().fg(theme::FG)),
+                    Span::styled(format!("  {parent}"), Style::default().fg(theme::DIM)),
+                ]))
             })
             .collect();
 
-        let title = format!(" results ({}) ", self.results.len());
+        let title = Line::from(vec![
+            Span::styled(" Results ", Style::default().fg(theme::DIM)),
+            Span::styled(
+                format!("{} ", self.results.len()),
+                Style::default().fg(theme::BORDER),
+            ),
+        ]);
+        let focused = self.mode == Mode::Normal;
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(panel(title, focused))
             .highlight_style(
                 Style::default()
-                    .bg(Color::DarkGray)
+                    .bg(theme::SEL_BG)
+                    .fg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD),
             )
-            .highlight_symbol("▶ ");
+            .highlight_symbol("▌ ");
         frame.render_stateful_widget(list, area, &mut self.list_state);
     }
 
     fn render_preview(&mut self, frame: &mut Frame, area: Rect) {
-        let title = self
-            .selected()
-            .map(|r| format!(" {} ", r.path.display()))
-            .unwrap_or_else(|| " preview ".to_string());
-        let block = Block::default().borders(Borders::ALL).title(title);
+        // Lead with the filename; the directory trails behind it, dimmed.
+        let title = match self.selected() {
+            Some(r) => {
+                let name = r
+                    .path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let parent = r.path.parent().map(pretty_dir).unwrap_or_default();
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {name} "),
+                        Style::default()
+                            .fg(theme::ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("{parent} "), Style::default().fg(theme::DIM)),
+                ])
+            }
+            None => Line::from(Span::styled(" Preview ", Style::default().fg(theme::DIM))),
+        };
+        let block = panel(title, false);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -893,11 +971,11 @@ impl App {
             Preview::Text(t) | Preview::Meta(t) => t.clone(),
             Preview::Loading => Text::from(Line::from(Span::styled(
                 "…",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::DIM),
             ))),
             Preview::Error(e) => Text::from(Line::from(Span::styled(
                 e.clone(),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme::RED),
             ))),
             // Image handled above; if we get here the picker failed.
             Preview::Image(_) => Text::from("image"),
@@ -906,28 +984,55 @@ impl App {
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
-        let help = "↑/↓ move · Enter open · o open-with · Ctrl-a ask AI · F1 help · Esc/q quit";
-        let line = Line::from(vec![
-            Span::styled(
-                format!(" {} ", self.status),
-                Style::default().fg(Color::Black).bg(Color::Cyan),
-            ),
-            Span::raw("  "),
-            Span::styled(help, Style::default().fg(Color::DarkGray)),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
+        // Status on the left, key hints right-aligned: keys in the accent,
+        // their labels dim, so the bar reads as guidance rather than chrome.
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(area);
+
+        let status = Line::from(Span::styled(
+            format!(" {}", self.status),
+            Style::default().fg(theme::DIM),
+        ));
+        frame.render_widget(Paragraph::new(status), cols[0]);
+
+        let key = Style::default().fg(theme::ACCENT);
+        let label = Style::default().fg(theme::DIM);
+        let mut hints: Vec<Span> = Vec::new();
+        for (i, (k, l)) in [
+            ("↑↓", "move"),
+            ("⏎", "open"),
+            ("o", "open with"),
+            ("F1", "help"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            if i > 0 {
+                hints.push(sep());
+            }
+            hints.push(Span::styled(*k, key));
+            hints.push(Span::raw(" "));
+            hints.push(Span::styled(*l, label));
+        }
+        hints.push(Span::raw(" "));
+        frame.render_widget(
+            Paragraph::new(Line::from(hints)).alignment(Alignment::Right),
+            cols[1],
+        );
     }
 }
 
 /// Colour used for an open-with entry's label, grouping it by kind at a glance.
 fn kind_color(kind: AppKind) -> Color {
     match kind {
-        AppKind::Editor => Color::Cyan,
-        AppKind::Image => Color::Green,
-        AppKind::Pdf => Color::Red,
-        AppKind::Media => Color::Magenta,
-        AppKind::Default => Color::Yellow,
-        AppKind::Reveal | AppKind::Terminal => Color::Gray,
+        AppKind::Editor => theme::ACCENT,
+        AppKind::Image => theme::GREEN,
+        AppKind::Pdf => theme::RED,
+        AppKind::Media => theme::VIOLET,
+        AppKind::Default => theme::AMBER,
+        AppKind::Reveal | AppKind::Terminal => theme::DIM,
     }
 }
 
@@ -940,7 +1045,7 @@ fn render_help(frame: &mut Frame) {
         ("PageUp / PageDown", "move by 10"),
         ("Enter", "open in the right app for the file"),
         ("o  ·  Ctrl-o", "open-with menu (choose an app)"),
-        ("Ctrl-a", "ask in plain language (needs local Ollama)"),
+        ("Ctrl-a", "ask in plain language (local Ollama)"),
         ("y  ·  Ctrl-y", "copy the file path to the clipboard"),
         ("Ctrl-u", "clear the query"),
         ("Esc", "Insert → Normal mode"),
@@ -954,30 +1059,27 @@ fn render_help(frame: &mut Frame) {
         .iter()
         .map(|(key, desc)| {
             Line::from(vec![
-                Span::styled(
-                    format!(" {key:<26}"),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(*desc, Style::default().fg(Color::Gray)),
+                Span::styled(format!("{key:<26}"), Style::default().fg(theme::ACCENT)),
+                Span::styled(*desc, Style::default().fg(theme::DIM)),
             ])
         })
         .collect();
 
     let height = rows.len() as u16 + 2;
-    let area = centered_rect(64, height.min(frame.area().height), frame.area());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
+    let area = centered_rect(66, height.min(frame.area().height), frame.area());
+    let block = panel(
+        Line::from(Span::styled(
             " Keys ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ))
-        .title_bottom(Line::from(Span::styled(
-            " any key to close ",
-            Style::default().fg(Color::DarkGray),
-        )));
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        true,
+    )
+    .title_bottom(Line::from(Span::styled(
+        " any key to close ",
+        Style::default().fg(theme::BORDER),
+    )));
 
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -1006,5 +1108,109 @@ fn type_tag(t: deepsearch_core::FileType) -> &'static str {
         Docx => "doc",
         Image => "img",
         Binary => "bin",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deepsearch_core::index::{Index, PendingDoc};
+    use deepsearch_core::FileType;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    /// Term frequencies built through the real tokenizer, so query-time stemming
+    /// lines up with what the fixture indexed.
+    fn tf_of(text: &str) -> HashMap<String, u32> {
+        let mut m = HashMap::new();
+        for t in deepsearch_core::tokenize::tokenize(text) {
+            *m.entry(t).or_insert(0) += 1;
+        }
+        m
+    }
+
+    /// Build a tiny in-memory index so the UI has something to draw.
+    fn demo_app() -> App {
+        let mut idx = Index::new();
+        for (path, ft) in [
+            ("/home/juan/notes/meeting-notes.md", FileType::Text),
+            ("/home/juan/src/deepsearch/notes-parser.rs", FileType::Text),
+            ("/home/juan/Pictures/notes-diagram.png", FileType::Image),
+            ("/home/juan/docs/notes-archive.pdf", FileType::Pdf),
+        ] {
+            let p = PathBuf::from(path);
+            let file_name = p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            idx.add(PendingDoc {
+                path: p,
+                size: 1024,
+                mtime: 1,
+                file_type: ft,
+                content_tf: tf_of("meeting notes about the project"),
+                name_tf: tf_of(&file_name),
+                name_raw: deepsearch_core::tokenize::normalize(&file_name),
+            });
+        }
+        let mut app = App::new(DeepSearch::new(idx), QueryOptions::default());
+        app.input = "notes".to_string();
+        app.run_search();
+        app
+    }
+
+    /// Render the UI into an off-screen buffer and return it as plain text, so
+    /// the layout can be inspected (and regressions caught) without a terminal.
+    fn render_to_text(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn renders_main_layout() {
+        let mut app = demo_app();
+        let out = render_to_text(&mut app, 100, 18);
+        println!("\n{out}\n");
+        // Chrome, query and results are all present.
+        assert!(out.contains("deepsearch"), "title bar");
+        assert!(out.contains("INSERT"), "mode badge");
+        assert!(out.contains("Results"), "results pane");
+        assert!(out.contains("meeting-notes.md"), "a result row");
+        assert!(out.contains("╭") && out.contains("╮"), "rounded corners");
+    }
+
+    #[test]
+    fn renders_ai_badges_when_available() {
+        let mut app = demo_app();
+        // Pretend a local Ollama with embeddings was found.
+        app.ai_available = true;
+        app.has_embeddings = true;
+        let out = render_to_text(&mut app, 100, 8);
+        println!("\n{out}\n");
+        assert!(out.contains("semantic"), "semantic badge");
+        assert!(out.contains("ask AI"), "ask-AI badge");
+    }
+
+    #[test]
+    fn renders_help_overlay() {
+        let mut app = demo_app();
+        app.show_help = true;
+        let out = render_to_text(&mut app, 100, 22);
+        println!("\n{out}\n");
+        assert!(out.contains("Keys"), "help title");
+        assert!(out.contains("any key to close"), "help footer");
     }
 }
