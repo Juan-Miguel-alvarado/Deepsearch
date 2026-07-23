@@ -286,28 +286,48 @@ deepsearch stats                   Index size, term counts, tombstone ratio.
         --cache <FILE>             Use a non-default index location (global flag).
 ```
 
-### Natural-language search (optional, local & free)
+### Ask questions about your files (optional, local & free)
 
-If you have [Ollama](https://ollama.com) running locally, deepsearch can turn a
-plain-language request into a query for you — no API keys, no cloud, nothing
-leaves your machine (it talks to `localhost:11434`).
+With [Ollama](https://ollama.com) running locally, `ask` doesn't just find files
+— it **answers**, from what's actually inside them, and cites the sources:
 
 ```bash
-deepsearch ask "screenshots from my rust project"
-# → type:image rust
-#  1.  2.130  [image]  ~/rust/app/docs/demo.png
-#  ...
+deepsearch ask "how are passwords handled in my projects?"
+```
+```
+reading 3 file(s)…
+
+The password is typed as a text input, but it can be switched to display the
+password by clicking a button. The password itself is not stored anywhere in
+this excerpt. [3]
+
+Sources:
+  [1] ~/development/flutter/docs/.../Gradle-for-Android.md
+  [2] ~/Documents/proyects/.../ChangePasswordForm.tsx
+  [3] ~/Documents/proyects/.../password-input.tsx
 ```
 
-In the TUI, type what you're after and press **`Ctrl-a`**: a background thread
-asks the model, then replaces your query with the translated one and searches —
-the UI never blocks. The model rewrites the request into normal deepsearch
-syntax (keywords plus `type:`/`ext:` filters), which is then ranked as usual.
+It's retrieval-augmented generation over your own index: the question finds the
+most relevant documents (semantically when embeddings exist), deepsearch pulls
+the **passage that bears on the question** out of each one — not the file's
+imports — and a local model answers from those excerpts only, saying so plainly
+when they don't contain the answer. Nothing leaves the machine.
+
+`--json` emits `{ "answer": ..., "sources": [...] }` for scripting.
+
+**Speed.** This is the one slow feature: on a CPU-only machine expect roughly a
+minute per question (context length dominates, which is why only a few short
+excerpts are sent). A smaller model is markedly faster:
+
+```bash
+ollama pull llama3.2:1b
+export DEEPSEARCH_OLLAMA_MODEL=llama3.2:1b
+```
 
 It's entirely optional: with no Ollama installed, `ask` prints a friendly hint
-and everything else works exactly the same. deepsearch uses the first model
-Ollama has (or set `DEEPSEARCH_OLLAMA_MODEL=llama3.2`); point at a non-default
-server with `OLLAMA_HOST`.
+and everything else works exactly the same. deepsearch picks a locally installed
+model that can generate text (or set `DEEPSEARCH_OLLAMA_MODEL`); point at a
+non-default server with `OLLAMA_HOST`.
 
 ### Semantic search (search by meaning)
 

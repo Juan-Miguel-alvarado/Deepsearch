@@ -3,7 +3,7 @@
 //! Subcommands:
 //!   * `index [PATH]`   build (or `--incremental` update) the index.
 //!   * `query "<q>"`    one-shot ranked search (`--json` for scripts).
-//!   * `ask "<q>"`      natural-language search via a local Ollama model.
+//!   * `ask "<q>"`      answer a question from your files (local Ollama).
 //!   * `tui [PATH]`     interactive fuzzy search UI.
 //!   * `stats`          report on the current index.
 
@@ -69,9 +69,10 @@ enum Command {
         #[arg(long)]
         keyword: bool,
     },
-    /// Ask in plain language; a local Ollama model turns it into a query.
+    /// Ask a question about your files; a local model answers from their
+    /// contents and cites the sources.
     Ask {
-        /// The natural-language request (all words joined).
+        /// The question (all words joined).
         #[arg(required = true)]
         request: Vec<String>,
         /// Maximum number of results.
@@ -283,45 +284,149 @@ fn cmd_query(
     Ok(())
 }
 
-/// Natural-language search: a local Ollama model rewrites the request into a
-/// deepsearch query, which is then run through the normal ranker.
-fn cmd_ask(cache: Option<&std::path::Path>, request: &str, limit: usize, json: bool) -> Result<()> {
+/// How many files are fed to the model as context when answering a question.
+/// Small on purpose: a local CPU model slows down fast as context grows.
+const ANSWER_SOURCES: usize = 3;
+/// Characters of each file handed to the model — a *relevant* window, not the
+/// head of the file.
+const SNIPPET_CHARS: usize = 700;
+
+/// Locate a question word in `haystack`, tolerating simple inflection: if the
+/// whole word isn't there, retry with successively shorter prefixes so
+/// `passwords` still finds `password`.
+fn find_term(haystack: &str, term: &str) -> Option<usize> {
+    let mut candidate: &str = term;
+    loop {
+        if let Some(pos) = haystack.find(candidate) {
+            return Some(pos);
+        }
+        if candidate.chars().count() <= 4 {
+            return None;
+        }
+        let mut chars = candidate.chars();
+        chars.next_back();
+        candidate = chars.as_str();
+    }
+}
+
+/// Pick the most useful window of `text` for `question`.
+///
+/// Feeding the first N characters of a file usually means feeding its imports
+/// and licence header. Centring the window on the first place a question word
+/// appears gives the model the part that actually bears on the question — which
+/// both improves the answer and keeps the prompt (and so the latency) small.
+fn relevant_snippet(text: &str, question: &str, max_chars: usize) -> String {
+    let lower = text.to_lowercase();
+    let hit = question
+        .to_lowercase()
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .filter(|w| w.chars().count() >= 3)
+        .filter_map(|w| find_term(&lower, &w))
+        .min();
+
+    let start = match hit {
+        // Back up a little so the match has context before it.
+        Some(byte_pos) => text[..byte_pos]
+            .chars()
+            .count()
+            .saturating_sub(max_chars / 3),
+        None => 0,
+    };
+    text.chars().skip(start).take(max_chars).collect()
+}
+
+/// Ask a question about your files and get an **answer**, not just a file list.
+///
+/// Retrieval-augmented: the question is used to find the most relevant documents
+/// (semantically when embeddings exist), their text is extracted, and a local
+/// model answers from those excerpts, citing which ones it used.
+fn cmd_ask(
+    cache: Option<&std::path::Path>,
+    question: &str,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
     if !ai::available() {
         anyhow::bail!(
-            "natural-language search needs a local Ollama server.\n\
+            "asking questions needs a local Ollama server.\n\
              Install it from https://ollama.com, run `ollama serve`, and pull a model \
              (e.g. `ollama pull llama3.2`). deepsearch works without it — use `query` instead."
         );
     }
     let ds = load_or_hint(cache)?;
-    let query = match ai::translate_query(request) {
-        Ok(q) => q,
-        Err(e) => anyhow::bail!("{e}"),
-    };
-    // Show what it understood (to stderr, so `--json` stdout stays clean).
-    eprintln!("→ {query}");
 
+    // 1. Find the files most likely to hold the answer.
     let opts = QueryOptions {
-        limit,
+        limit: limit.max(ANSWER_SOURCES),
         ..QueryOptions::default()
     };
-    let (results, _) = run_search(&ds, &query, &opts, false);
+    let (results, semantic) = run_search(&ds, question, &opts, false);
+    if results.is_empty() {
+        println!("No files matched that question.");
+        return Ok(());
+    }
+
+    // 2. Read the top candidates; skip anything with no extractable text.
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for r in &results {
+        if sources.len() >= ANSWER_SOURCES {
+            break;
+        }
+        if let Ok(ext) = deepsearch_core::extract::extract(&r.path) {
+            if let Some(text) = ext.text {
+                if !text.trim().is_empty() {
+                    let snippet = relevant_snippet(&text, question, SNIPPET_CHARS);
+                    sources.push((r.path.display().to_string(), snippet));
+                }
+            }
+        }
+    }
+    if sources.is_empty() {
+        println!("Found matching files, but none had readable text to answer from.");
+        return Ok(());
+    }
+
+    eprintln!(
+        "reading {} file(s){}…",
+        sources.len(),
+        if semantic { " (semantic match)" } else { "" }
+    );
+
+    // 3. Let the local model answer from those excerpts.
+    let answer = match ai::answer_with_context(question, &sources) {
+        Ok(a) => a,
+        Err(e) => anyhow::bail!("{e}"),
+    };
+
     if json {
-        print_json(&results);
-    } else if results.is_empty() {
-        println!("No results for {query:?}.");
+        print_answer_json(&answer, &sources);
     } else {
-        for (i, r) in results.iter().enumerate() {
-            println!(
-                "{:>2}. {:>7.3}  [{}]  {}",
-                i + 1,
-                r.score,
-                r.file_type.as_str(),
-                r.path.display()
-            );
+        println!("\n{answer}\n");
+        println!("Sources:");
+        for (i, (label, _)) in sources.iter().enumerate() {
+            println!("  [{}] {}", i + 1, label);
         }
     }
     Ok(())
+}
+
+/// Hand-rolled JSON for `ask --json` (keeps stdout machine-readable).
+fn print_answer_json(answer: &str, sources: &[(String, String)]) {
+    let esc = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    };
+    println!("{{");
+    println!("  \"answer\": \"{}\",", esc(answer));
+    println!("  \"sources\": [");
+    for (i, (label, _)) in sources.iter().enumerate() {
+        let comma = if i + 1 < sources.len() { "," } else { "" };
+        println!("    \"{}\"{}", esc(label), comma);
+    }
+    println!("  ]");
+    println!("}}");
 }
 
 /// Default action (bare `deepsearch`): incrementally refresh the index of the
@@ -445,4 +550,31 @@ fn print_json(results: &[deepsearch_core::SearchResult]) {
         );
     }
     println!("]");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snippet_centres_on_the_match() {
+        let text = format!(
+            "{}PASSWORD hashing happens here{}",
+            "x".repeat(500),
+            "y".repeat(500)
+        );
+        let snip = relevant_snippet(&text, "how are passwords handled", 200);
+        assert!(
+            snip.contains("PASSWORD hashing"),
+            "window should include the match"
+        );
+        assert!(snip.chars().count() <= 200);
+    }
+
+    #[test]
+    fn snippet_falls_back_to_head_without_a_match() {
+        let text = "alpha beta gamma delta";
+        let snip = relevant_snippet(text, "zzzz nothing matches", 10);
+        assert_eq!(snip, "alpha beta");
+    }
 }

@@ -40,9 +40,9 @@ fn quick_agent() -> ureq::Agent {
 fn gen_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_millis(800))
-        // Generous: the very first request also loads the model into memory,
-        // which can take a while on a cold/busy machine.
-        .timeout(Duration::from_secs(120))
+        // Generous: the first request also loads the model into memory, and
+        // answering from file excerpts is the slowest thing we ask of it.
+        .timeout(Duration::from_secs(240))
         .build()
 }
 
@@ -199,6 +199,71 @@ pub fn translate_query(request: &str) -> Result<String, String> {
         return Err("the model returned an empty query".to_string());
     }
     Ok(query)
+}
+
+/// How much of each source file we put in the prompt. Context length is the main
+/// driver of latency on a local CPU model, so this stays deliberately tight.
+const SOURCE_CHARS: usize = 1500;
+
+/// Answer `question` using excerpts from the user's own files.
+///
+/// This is retrieval-augmented generation over the local index: the caller finds
+/// the relevant files, and the model answers **only** from their contents,
+/// citing which excerpt each claim came from. Nothing leaves the machine.
+pub fn answer_with_context(question: &str, sources: &[(String, String)]) -> Result<String, String> {
+    if sources.is_empty() {
+        return Err("no relevant files to answer from".to_string());
+    }
+    let model = pick_model()?;
+
+    let mut context = String::new();
+    for (i, (label, text)) in sources.iter().enumerate() {
+        let body: String = text.chars().take(SOURCE_CHARS).collect();
+        context.push_str(&format!("[{}] {}\n{}\n\n", i + 1, label, body.trim()));
+    }
+
+    let prompt = format!(
+        "You answer questions about the user's own files, using ONLY the excerpts \
+below.\n\
+\n\
+Rules:\n\
+- Answer from the excerpts only. If they don't contain the answer, say so \
+plainly instead of guessing.\n\
+- Cite the excerpts you used by number, like [1] or [2].\n\
+- Reply in the same language as the question.\n\
+- Be concise: a few sentences, no preamble.\n\
+\n\
+Excerpts:\n\
+{context}\
+Question: {question}\n\
+Answer:"
+    );
+
+    let payload = serde_json::json!({
+        "model": model,
+        "prompt": prompt,
+        "stream": false,
+        // Cap the answer: on a CPU model every token costs real seconds, and the
+        // useful answer here is a couple of sentences.
+        "options": { "temperature": 0.2, "num_predict": 160 },
+    });
+    let resp = gen_agent()
+        .post(&format!("{}/api/generate", host()))
+        .send_json(payload)
+        .map_err(|e| format!("Ollama request failed: {e}"))?;
+    let body: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("bad response from Ollama: {e}"))?;
+    let answer = body
+        .get("response")
+        .and_then(|r| r.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if answer.is_empty() {
+        return Err("the model returned an empty answer".to_string());
+    }
+    Ok(answer)
 }
 
 /// Default embedding model (small, local, good for retrieval).
