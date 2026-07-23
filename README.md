@@ -1,8 +1,5 @@
 # deepsearch
 
-<img width="1346" height="710" alt="image" src="https://github.com/user-attachments/assets/84cb6309-8720-446c-acd9-125265ace9cb" />
-
-
 [![Release](https://img.shields.io/github/v/release/Juan-Miguel-alvarado/Deepsearch?sort=semver)](https://github.com/Juan-Miguel-alvarado/Deepsearch/releases/latest)
 
 Relevance-ranked full-text search over **all** your files, from the terminal.
@@ -27,8 +24,7 @@ deepsearch tui                   # interactive fuzzy search
 
 ---
 
-<img width="1352" height="718" alt="image" src="https://github.com/user-attachments/assets/81edafd6-d82f-406a-98d0-77a58a76a175" />
-
+<img width="1346" height="710" alt="image" src="https://github.com/user-attachments/assets/15acf9b5-1592-4ce2-9e61-19d46327882b" />
 
 
 https://github.com/user-attachments/assets/f68476ca-0f2e-4101-a1b6-f9b6e720894e
