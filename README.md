@@ -27,7 +27,8 @@ deepsearch                            # the interactive TUI
 
 ---
 
-<img width="1346" height="710" alt="image" src="https://github.com/user-attachments/assets/15acf9b5-1592-4ce2-9e61-19d46327882b" />
+<img width="1344" height="719" alt="image" src="https://github.com/user-attachments/assets/bd58f3a6-e922-4af3-a0ad-69e3afea244b" />
+
 
 ---
 
