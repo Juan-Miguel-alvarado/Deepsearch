@@ -142,11 +142,21 @@ pub fn candidates_for(path: &Path, file_type: FileType) -> Vec<OpenApp> {
             );
         }
     }
-    // 5. Location actions on the containing folder.
-    if let Some(parent) = path.parent() {
+    // 5. Location actions. For a directory the location *is* the item, so
+    //    "terminal here" opens inside it rather than in its parent.
+    let location = if file_type == FileType::Dir {
+        Some(path.to_path_buf())
+    } else {
+        path.parent().map(|p| p.to_path_buf())
+    };
+    if let Some(parent) = location {
         let dir = parent.to_string_lossy().to_string();
         if let Some(mut rev) = default_opener() {
-            rev.label = "Reveal in folder".to_string();
+            rev.label = if file_type == FileType::Dir {
+                "Open folder".to_string()
+            } else {
+                "Reveal in folder".to_string()
+            };
             rev.kind = AppKind::Reveal;
             rev.args.push(dir.clone());
             apps.push(rev);
@@ -168,6 +178,9 @@ fn primary_category(ft: FileType, ext: &str) -> Option<Cat> {
         FileType::Pdf => Some(Cat::Pdf),
         FileType::Text | FileType::Code => Some(Cat::Editor),
         FileType::Docx => None,
+        // A folder is best handed to the file manager (the OS default), though
+        // editors can open it as a project, so they stay in the list.
+        FileType::Dir => None,
         // Type is content-based and doesn't distinguish video/audio from other
         // binaries, so fall back to the extension purely for menu ordering.
         FileType::Binary => {

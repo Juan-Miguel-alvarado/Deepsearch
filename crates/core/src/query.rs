@@ -371,6 +371,7 @@ fn parse_file_type(v: &str) -> Option<FileType> {
         "docx" | "doc" | "word" => FileType::Docx,
         "image" | "img" | "picture" => FileType::Image,
         "binary" | "bin" => FileType::Binary,
+        "dir" | "folder" | "directory" => FileType::Dir,
         _ => return None,
     })
 }

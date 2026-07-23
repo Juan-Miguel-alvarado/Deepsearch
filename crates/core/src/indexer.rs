@@ -71,7 +71,11 @@ pub struct IndexStats {
     pub errors: usize,
 }
 
-/// Collect the candidate file paths under `root`, applying ignore rules.
+/// Collect the candidate paths under `root`, applying ignore rules.
+///
+/// Directories are included alongside files (indexed by name only), so folders
+/// are findable too — `~/projects/invoices` is often what you were looking for,
+/// not a file inside it. The root itself is skipped.
 pub fn walk(root: &Path, opts: &IndexOptions) -> Vec<PathBuf> {
     let mut builder = ignore::WalkBuilder::new(root);
     builder
@@ -88,7 +92,15 @@ pub fn walk(root: &Path, opts: &IndexOptions) -> Vec<PathBuf> {
             Ok(e) => e,
             Err(_) => continue, // unreadable dir/permission error: skip, don't abort
         };
-        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
+        // Skip the root directory itself: indexing it adds a doc for the search
+        // root that nobody is looking for.
+        if ft.is_dir() && entry.path() == root {
+            continue;
+        }
+        if ft.is_file() || ft.is_dir() {
             paths.push(entry.into_path());
         }
     }
@@ -194,14 +206,6 @@ fn index_paths(index: &mut Index, paths: &[PathBuf], progress: &Progress, stats:
 /// Tokenize a single file into a `PendingDoc`. Returns `Ok(None)` only on hard
 /// failures we chose to skip; `Err` is unused today but kept for symmetry.
 fn tokenize_file(path: &Path) -> Result<Option<PendingDoc>, ()> {
-    // Guard the whole extraction (PDF parsing in particular can panic) so one
-    // corrupt file can never bring the run down.
-    let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extract(path)));
-    let extracted = match extracted {
-        Ok(Ok(e)) => e,
-        _ => return Ok(None),
-    };
-
     let meta = std::fs::metadata(path).map_err(|_| ())?;
     let mtime = mtime_of(path).unwrap_or(0);
 
@@ -214,6 +218,27 @@ fn tokenize_file(path: &Path) -> Result<Option<PendingDoc>, ()> {
     let mut name_raw: Vec<String> = crate::tokenize::normalize(&name);
     name_raw.sort();
     name_raw.dedup();
+
+    // Directories carry no content: they're indexed by name alone.
+    if meta.is_dir() {
+        return Ok(Some(PendingDoc {
+            path: path.to_path_buf(),
+            size: 0,
+            mtime,
+            file_type: crate::extract::FileType::Dir,
+            content_tf: Default::default(),
+            name_tf,
+            name_raw,
+        }));
+    }
+
+    // Guard the whole extraction (PDF parsing in particular can panic) so one
+    // corrupt file can never bring the run down.
+    let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extract(path)));
+    let extracted = match extracted {
+        Ok(Ok(e)) => e,
+        _ => return Ok(None),
+    };
 
     let content_tf = match &extracted.text {
         Some(text) => count(tokenize(text)),
@@ -277,6 +302,36 @@ mod tests {
         assert_eq!(idx.live_docs, 2);
         let hits = crate::query::search(&idx, "fox", &crate::query::QueryOptions::default());
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn indexes_directories_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("invoices/2025")).unwrap();
+        std::fs::write(dir.path().join("invoices/2025/jan.txt"), "hello").unwrap();
+
+        let mut idx = Index::new();
+        build(
+            &mut idx,
+            dir.path(),
+            &IndexOptions::default(),
+            &Progress::default(),
+        );
+
+        // Both nested directories are indexed; the root itself is not.
+        let dirs: Vec<_> = idx
+            .docs
+            .iter()
+            .flatten()
+            .filter(|m| m.file_type == crate::extract::FileType::Dir)
+            .map(|m| m.path.clone())
+            .collect();
+        assert_eq!(dirs.len(), 2, "invoices and invoices/2025");
+        assert!(!dirs.contains(&dir.path().to_path_buf()), "root is skipped");
+
+        // And a folder is findable by name.
+        let hits = crate::query::search(&idx, "invoices", &crate::query::QueryOptions::default());
+        assert!(!hits.is_empty(), "directory found by name");
     }
 
     #[test]

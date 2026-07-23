@@ -371,12 +371,14 @@ on its own browses the corpus (newest first):
 | `type:code` / `type:text` | source / plain text |
 | `type:docx` (`doc`) | Word documents |
 | `type:binary` (`bin`) | other binaries |
+| `type:dir` (`folder`) | **folders** |
 | `ext:rs`, `ext:.md` | files with that extension (dot optional) |
 
 ```
 deepsearch query "parser ext:rs"     # 'parser' in .rs files only
 deepsearch query "invoice type:pdf"  # 'invoice' among PDFs
 deepsearch query "type:image"        # every image, most recent first
+deepsearch query "invoices type:dir"  # find the folder, not the files in it
 ```
 
 ### TUI keys

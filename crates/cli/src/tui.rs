@@ -1108,6 +1108,7 @@ fn type_tag(t: deepsearch_core::FileType) -> &'static str {
         Docx => "doc",
         Image => "img",
         Binary => "bin",
+        Dir => "dir",
     }
 }
 

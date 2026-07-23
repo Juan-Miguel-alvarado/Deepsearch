@@ -27,6 +27,9 @@ pub enum FileType {
     Docx,
     Image,
     Binary,
+    /// A directory. Indexed by name only — folders are worth finding too.
+    /// Kept last so older serialized indexes keep their variant numbering.
+    Dir,
 }
 
 impl FileType {
@@ -38,6 +41,7 @@ impl FileType {
             FileType::Docx => "docx",
             FileType::Image => "image",
             FileType::Binary => "binary",
+            FileType::Dir => "dir",
         }
     }
 

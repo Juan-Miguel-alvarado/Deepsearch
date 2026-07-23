@@ -102,7 +102,59 @@ fn build_preview(syntaxes: &SyntaxSet, theme: &Theme, req: &PreviewRequest) -> P
         FileType::Binary => meta_preview(req),
         FileType::Text | FileType::Code => text_preview(syntaxes, theme, req),
         FileType::Pdf | FileType::Docx => document_preview(req),
+        FileType::Dir => dir_preview(req),
     }
+}
+
+/// Preview for a directory: list what's inside, folders first.
+fn dir_preview(req: &PreviewRequest) -> Preview {
+    let entries = match std::fs::read_dir(&req.path) {
+        Ok(rd) => rd,
+        Err(e) => return Preview::Error(format!("cannot read directory: {e}")),
+    };
+
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => dirs.push(name),
+            _ => files.push(name),
+        }
+    }
+    dirs.sort();
+    files.sort();
+
+    let dir_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let file_style = Style::default().fg(Color::Gray);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("{} folders, {} files", dirs.len(), files.len()),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    )));
+    lines.push(Line::from(""));
+
+    for name in dirs.iter().take(MAX_PREVIEW_LINES / 2) {
+        lines.push(overlay_matches(
+            vec![(dir_style, format!("{name}/"))],
+            &req.terms,
+        ));
+    }
+    for name in files
+        .iter()
+        .take(MAX_PREVIEW_LINES.saturating_sub(lines.len()))
+    {
+        lines.push(overlay_matches(
+            vec![(file_style, name.clone())],
+            &req.terms,
+        ));
+    }
+    Preview::Text(Text::from(lines))
 }
 
 /// Largest image dimension we keep; larger images are downscaled so building
