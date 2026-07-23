@@ -6,28 +6,28 @@ Relevance-ranked full-text search over **all** your files, from the terminal.
 
 `deepsearch` is not `find` or `grep`. It scans your filesystem **once**, builds a
 persistent inverted index, and then answers queries in **sub-millisecond** time,
-ranked by **BM25 relevance** — searching both file *names* and file *contents*.
-An interactive TUI gives you incremental search — matching prefixes as you type,
-with `type:`/`ext:` filters — live, syntax-highlighted previews (and image
-previews via the terminal graphics protocol), an **open-with** menu that
-launches the selected file in whatever app you have installed (editor, image/PDF
-viewer, media player, or the OS default), one-key **copy-path**, and optional
-AI features via a local [Ollama](https://ollama.com) model (free, offline, no API
-keys): **natural-language queries** and **semantic search** that finds files by
-meaning, not just keywords.
+ranked by **BM25 relevance** over both file *names* and file *contents*.
+
+- **Ranked search that keeps up with you** — prefix matching as you type, typo
+  tolerance, and `type:`/`ext:` filters. Folders are indexed too, so you can find
+  a directory and not just the files inside it.
+- **A TUI built for browsing** — live syntax-highlighted previews (images render
+  through the terminal's graphics protocol), an **open-with** menu that launches
+  a file in whatever app you actually have installed, and one-key copy-path.
+- **Optional local AI**, via [Ollama](https://ollama.com) — free, offline, no API
+  keys. **Semantic search** finds files by meaning rather than by keyword, and
+  **`ask`** answers questions from what's inside your files, citing its sources.
 
 ```
-deepsearch index ~/projects      # scan & index once (incremental afterwards)
-deepsearch query "bm25 ranking"  # ranked results, name + content
-deepsearch tui                   # interactive fuzzy search
+deepsearch index ~/projects           # scan & index once (incremental afterwards)
+deepsearch query "bm25 ranking"       # ranked results, name + content
+deepsearch ask "how does auth work?"  # an answer from your files, with sources
+deepsearch                            # the interactive TUI
 ```
 
 ---
 
 <img width="1346" height="710" alt="image" src="https://github.com/user-attachments/assets/15acf9b5-1592-4ce2-9e61-19d46327882b" />
-
-
-
 
 ---
 
@@ -80,36 +80,34 @@ cargo install --path crates/cli --force
 
 ## Quickstart
 
-New here? Try it on a single folder in under a minute — no need to index your
-whole home directory. The `--cache` flag keeps this trial index separate from
-your real one:
+Try it on one folder first — indexing your whole home directory can wait.
+`--cache` keeps this trial index separate from your real one, so nothing you do
+here affects it:
 
 ```bash
-# 1. build the project
-cargo build --release
+# index a single folder into a throwaway cache
+deepsearch --cache /tmp/ds-demo.bin index ~/Documents
 
-# 2. index just this repo into a throwaway cache
-./target/release/deepsearch --cache /tmp/ds-demo.bin index .
+# one-shot query from the shell
+deepsearch --cache /tmp/ds-demo.bin query "invoice"
 
-# 3a. one-shot query from the shell
-./target/release/deepsearch --cache /tmp/ds-demo.bin query "bm25" 
-
-# 3b. or the interactive UI
-./target/release/deepsearch --cache /tmp/ds-demo.bin tui
+# or the interactive UI
+deepsearch --cache /tmp/ds-demo.bin tui
 ```
 
 Things to try inside the TUI:
 
 - **Type a partial word** (`conf`) — results filter as you type, before you
   finish `config`.
-- **Filter** with `ext:rs parser` or `type:image` right in the query box.
+- **Filter** with `ext:rs parser`, `type:image`, or `type:dir` to find a folder.
 - Press **`Enter`** to open a file in the right app for its type (text in your
   editor, an image in an image viewer, a PDF in a PDF reader…).
 - Press **`o`** for the **open-with menu** and hit a number to launch instantly.
 - Press **`y`** to **copy the file's path**, and **`F1`** for the key help.
 
-For real use, just run `deepsearch` with no arguments: it indexes your home
-directory the first time (incrementally after that), then opens the UI.
+When you're ready for the real thing, run `deepsearch` with no arguments: it
+indexes your home directory the first time (incrementally after that), then
+opens the UI.
 
 ---
 
@@ -118,18 +116,18 @@ directory the first time (incrementally after that), then opens the UI.
 Three layers, with a hard boundary between the engine and the UI:
 
 ```
-┌──────────────────────────────────────────────┐
-│ crates/cli   deepsearch (binary)              │
-│   · clap CLI  (index / query / tui / stats)   │
-│   · ratatui TUI + async preview worker        │
-└───────────────▲──────────────────────────────┘
-                │  public API only
-┌───────────────┴──────────────────────────────┐
-│ crates/core  deepsearch-core (library)        │
-│   1. Indexer  — walk, extract, build index    │
-│   2. Query    — tokenize, BM25, prefix, fuzzy  │
-│   (usable with no TUI, no CLI)                 │
-└──────────────────────────────────────────────┘
+┌────────────────────────────────────────────────┐
+│  crates/cli   deepsearch (binary)              │
+│    · clap CLI (index / query / ask / stats)    │
+│    · ratatui TUI + preview and AI workers      │
+└──────────────────────▲─────────────────────────┘
+                       │ public API only
+┌──────────────────────┴─────────────────────────┐
+│  crates/core  deepsearch-core (library)        │
+│    1. Indexer — walk, extract, build index     │
+│    2. Query   — BM25 + prefix/fuzzy + semantic │
+│    (usable with no TUI, no CLI)                │
+└────────────────────────────────────────────────┘
 ```
 
 Layers 1 and 2 live in `deepsearch-core`, a standalone library with a public
@@ -256,6 +254,34 @@ them, falling back to **Unicode half-blocks** everywhere else. Its default
 `chafa` backend needs the `libchafa` system library, so it is disabled — the
 native protocols plus the half-block fallback cover every terminal with zero
 system deps.
+
+### AI that is optional by construction
+The AI features run against a **local** Ollama over plain HTTP to
+`localhost:11434` — no API keys, no account, nothing leaving the machine, and no
+cost to anyone. They are detected, never assumed: the TUI probes for a server
+once at startup (off-thread, so it never delays the UI) and only advertises the
+shortcut when one answers. With no Ollama installed, `ask` prints a hint and
+every other feature behaves exactly as before. Model choice is by *capability*,
+not by position in the list — an embedding-only model would be rejected by the
+generation endpoint, so completion-capable models are selected explicitly.
+
+### Semantic search: embeddings stored per document, blended with BM25
+Each document gets a unit-normalized embedding at index time (`--semantic`), so
+query-time scoring is a dot product. Ranking is **hybrid** rather than purely
+semantic: keyword scores are min-max normalized and combined as
+`(1 − w)·keyword + w·semantic`. Keeping both signals matters — exact keyword
+matching stays precise for names and identifiers, while the semantic half finds
+the file that discusses "authentication" when you searched for `login`. Because
+the two are unioned, a file can surface by meaning with no keyword hit at all.
+
+### Answering questions: retrieval first, generation second
+`ask` is retrieval-augmented: the index picks the candidate documents, and the
+model only ever sees excerpts from them, with instructions to answer from those
+excerpts or say it can't. The excerpt is a window **centred on the question**,
+not the head of the file — the head is usually imports and licence boilerplate,
+which is exactly how a model ends up claiming there's no information in a file
+that plainly has it. Context length is the dominant cost on a CPU-only machine,
+so few, short, relevant excerpts beat many long ones.
 
 ### Errors: one bad file can never take down the run
 `anyhow` for the application, `thiserror` for the library's typed errors. Text
@@ -436,26 +462,45 @@ cargo bench                                              # criterion: indexing +
 ## Testing
 
 ```
-cargo test        # unit tests: tokenizer, index, BM25 scoring, extraction, incremental
-cargo clippy --workspace --all-targets
+cargo test
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
 ```
 
-Unit tests cover the tokenizer (camel/snake splitting, stemming, edge cases), the
-inverted index (aggregates, tombstoning, compaction), BM25 scoring (idf
-monotonicity, relevance ordering, name-boost, prefix matching, fuzzy tolerance,
-`type:`/`ext:` filter parsing, tombstone exclusion), text extraction,
-incremental add/modify/delete, the open-with app detection, and the preview
-match-overlay.
+The engine is covered by unit tests: the tokenizer (camel/snake splitting,
+stemming, edge cases), the inverted index (aggregates, tombstoning, compaction),
+ranking (idf monotonicity, relevance ordering, name-boost, prefix matching, fuzzy
+tolerance, cosine and hybrid blending, `type:`/`ext:` filter parsing, tombstone
+exclusion), text extraction, incremental add/modify/delete, and directory
+indexing.
+
+The CLI side covers the open-with app detection, clipboard tool selection, the
+snippet window used for answering, Ollama model selection (an embedding-only
+model must never be chosen for generation), and the preview match-overlay.
+
+The **TUI renders into an off-screen `TestBackend`** and the resulting buffer is
+asserted as text, so the layout, the AI badges and the help overlay can be
+checked — and regressions caught — without a terminal.
 
 ---
 
 ## Limitations & future work
 
 - **Stemming is English-only.** Non-English content is still indexed and matched
-  exactly, just not stemmed.
+  exactly, just not stemmed. Semantic search covers much of this gap: it matches
+  a Spanish question against English documents perfectly well.
 - **First-character typos** are not fuzzy-matched (a deliberate latency
   trade-off; see above).
-- The index is loaded fully into RAM for querying. For *very* large corpora a
-  memory-mapped, block-compressed postings format would be the next step.
 - Fuzzy matching is filename-only, by design (typo tolerance is most useful for
   names; content is matched via stemming/BM25).
+- **Answering is the one slow feature.** On a CPU-only machine expect roughly a
+  minute per question, dominated by prompt evaluation. A smaller model
+  (`llama3.2:1b`) is markedly faster; a GPU more so.
+- **Building embeddings is a serial pass** — one Ollama call per document, and
+  they're only persisted at the end of the run, so interrupting a large
+  `--semantic` build loses that work. Batching and incremental saves are the
+  obvious next step.
+- `ask` lives in the CLI only; the TUI still searches rather than answers.
+- The index is loaded fully into RAM for querying, and embeddings make it
+  substantially larger. For *very* large corpora a memory-mapped,
+  block-compressed postings format would be the next step.
