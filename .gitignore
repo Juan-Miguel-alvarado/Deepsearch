@@ -8,3 +8,7 @@
 # Editor / OS junk
 *.swp
 .DS_Store
+
+# Frames captured for docs/demo.gif; regenerate with capture_demo_frames
+docs/frames/
+__pycache__/

@@ -29,7 +29,12 @@ deepsearch                            # the interactive TUI
 
 ---
 
-<img width="1344" height="719" alt="image" src="https://github.com/user-attachments/assets/bd58f3a6-e922-4af3-a0ad-69e3afea244b" />
+![deepsearch: a typo still finds the file, the caret walks back to fix it, and the results sharpen](docs/demo.gif)
+
+<sub>Typed with a typo on purpose — fuzzy filename matching finds `porcelain.rs` anyway; the
+caret steps back into the word, the missing letter goes in, and the ranking sharpens from one
+result to five. Generated from the real TUI, not a screen recording (see
+[Development](#development)).</sub>
 
 
 
@@ -558,6 +563,34 @@ overlay, and that `PageUp` moves by the height the last render actually had.
 The line editor is tested on its own, away from any terminal: caret movement,
 word deletion, multi-byte characters, wide characters measured in cells, and a
 query several times longer than its box.
+
+---
+
+## Development
+
+```
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+```
+
+### Regenerating the demo
+
+The GIF at the top is not a screen recording and nothing in it is hand-drawn. A test drives the
+real `App` with real keystrokes against a real index, renders each step through the same code the
+terminal uses, and writes the resulting cells out as ANSI; a script paints those frames. Change
+the layout and the next regeneration shows the change — the picture cannot quietly drift from the
+product.
+
+```bash
+cargo run --release -- --cache /tmp/ds-demo.bin index .
+DEMO_CACHE=/tmp/ds-demo.bin \
+    cargo test --release --bin deepsearch capture_demo_frames -- --ignored
+python3 docs/make-demo.py
+```
+
+The capture lives in `crates/cli/src/demo.rs` and `capture_demo_frames` in `tui.rs`; painting
+needs ImageMagick with the Pango delegate (`magick -list format | grep PANGO`).
 
 ---
 

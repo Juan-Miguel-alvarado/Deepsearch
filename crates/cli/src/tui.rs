@@ -1362,6 +1362,111 @@ mod tests {
             .join("\n")
     }
 
+    /// Drive the real UI through a scripted session and write every frame out as ANSI, for
+    /// `docs/make-demo.py` to turn into the README animation.
+    ///
+    /// Ignored by default: it wants a prepared index and writes files. See `crate::demo`.
+    #[test]
+    #[ignore = "generates README frames; see crates/cli/src/demo.rs for the recipe"]
+    fn capture_demo_frames() {
+        use std::path::PathBuf;
+
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 26;
+
+        let cache = std::env::var("DEMO_CACHE").unwrap_or_else(|_| "/tmp/ds-demo.bin".into());
+        let out_dir = PathBuf::from(
+            // Tests run with the crate as the working directory; the frames belong at the
+            // repository root next to the script that consumes them.
+            std::env::var("DEMO_FRAMES").unwrap_or_else(|_| {
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/frames").into()
+            }),
+        );
+        std::fs::create_dir_all(&out_dir).expect("frame directory");
+        for existing in std::fs::read_dir(&out_dir).into_iter().flatten().flatten() {
+            let _ = std::fs::remove_file(existing.path());
+        }
+
+        let ds = DeepSearch::open_or_empty(Some(std::path::Path::new(&cache)))
+            .expect("open the demo index");
+        assert!(
+            !ds.is_empty(),
+            "index {cache} is empty — build it first (see crate::demo)"
+        );
+        let mut app = App::new(ds, QueryOptions::default());
+
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        let mut frames: Vec<(String, u32)> = Vec::new();
+
+        // `hold` is in centiseconds, matching the GIF delay.
+        let mut shoot = |app: &mut App, hold: u32, frames: &mut Vec<(String, u32)>| {
+            terminal.draw(|f| app.render(f)).unwrap();
+            let mut buf = terminal.backend().buffer().clone();
+            // `set_cursor_position` moves the terminal's own caret and writes nothing into the
+            // buffer, so a captured frame has no visible caret at all — which would make the
+            // whole point of this demo, walking back into a word to fix it, look like six frames
+            // of nothing happening. Paint the block a terminal would draw.
+            let pos = terminal.get_cursor_position().unwrap();
+            if pos.x < buf.area.width && pos.y < buf.area.height {
+                buf[(pos.x, pos.y)].modifier |= Modifier::REVERSED;
+            }
+            frames.push((crate::demo::buffer_to_ansi(&buf), hold));
+        };
+
+        // Let the preview worker finish before capturing, so the pane is never caught mid-load.
+        fn settle(app: &mut App) {
+            for _ in 0..150 {
+                app.drain_previews();
+                if !matches!(app.preview, Preview::Loading) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        // 1. The empty state: what the tool offers before you type a thing.
+        shoot(&mut app, 140, &mut frames);
+
+        // 2. Type the query — with a typo, the way anyone actually types. Fuzzy filename
+        //    matching finds the file anyway, which is the point of the pause here.
+        for c in "porcelan".chars() {
+            app.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
+            shoot(&mut app, 9, &mut frames);
+        }
+        app.run_search();
+        settle(&mut app);
+        shoot(&mut app, 210, &mut frames);
+
+        // 3. Fix the typo *in place*: the caret steps back into the word and inserts the missing
+        //    letter. The old append-only box could only have deleted back to it.
+        app.handle_key(KeyCode::Left, KeyModifiers::NONE);
+        shoot(&mut app, 55, &mut frames);
+        app.handle_key(KeyCode::Char('i'), KeyModifiers::NONE);
+        app.run_search();
+        settle(&mut app);
+        shoot(&mut app, 230, &mut frames);
+
+        // 4. Walk the results; the preview follows the selection.
+        for _ in 0..2 {
+            app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+            settle(&mut app);
+            shoot(&mut app, 150, &mut frames);
+        }
+
+        // 5. The key help.
+        app.handle_key(KeyCode::F(1), KeyModifiers::NONE);
+        shoot(&mut app, 250, &mut frames);
+
+        let mut manifest = String::new();
+        for (i, (ansi, hold)) in frames.iter().enumerate() {
+            let name = format!("frame-{i:03}.ansi");
+            std::fs::write(out_dir.join(&name), ansi).expect("write frame");
+            manifest.push_str(&format!("{name} {hold}\n"));
+        }
+        std::fs::write(out_dir.join("manifest.txt"), manifest).expect("write manifest");
+        println!("wrote {} frames to {}", frames.len(), out_dir.display());
+    }
+
     #[test]
     fn renders_main_layout() {
         let mut app = demo_app();

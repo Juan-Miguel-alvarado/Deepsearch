@@ -9,6 +9,9 @@
 
 mod ai;
 mod clip;
+// Tooling for the README animation; nothing in the shipped binary needs it.
+#[cfg(test)]
+mod demo;
 mod input;
 mod open;
 mod preview;
