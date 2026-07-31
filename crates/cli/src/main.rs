@@ -9,6 +9,7 @@
 
 mod ai;
 mod clip;
+mod input;
 mod open;
 mod preview;
 mod tui;

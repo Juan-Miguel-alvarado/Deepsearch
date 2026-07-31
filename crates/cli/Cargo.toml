@@ -22,6 +22,9 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 # Native Kitty/Sixel/iTerm2 protocols + Unicode-halfblock fallback remain.
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
 image = "0.25"
+# Already in the tree via ratatui; used directly so the query box measures wide
+# characters in terminal cells rather than assuming one column each.
+unicode-width = "0.2"
 # Natural-language search talks to a local Ollama server over plain HTTP; no TLS
 # needed (localhost only), so drop ureq's default TLS/gzip features.
 ureq = { version = "2", default-features = false, features = ["json"] }

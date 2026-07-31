@@ -832,6 +832,7 @@ dependencies = [
  "ratatui-image",
  "serde_json",
  "syntect",
+ "unicode-width",
  "ureq",
 ]
 

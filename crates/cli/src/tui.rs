@@ -5,16 +5,22 @@
 //! built on a worker thread (see [`crate::preview`]) so keystrokes never block.
 //!
 //! Two modes (vim-flavoured):
-//!   * **Insert** (default): typing edits the query. Arrows move the selection,
-//!     Enter opens the file, Esc drops to Normal mode.
+//!   * **Insert** (default): typing edits the query, with the caret movement and
+//!     word-deletion keys a shell gives you (see [`crate::input`]). Up/Down move
+//!     the selection, Enter opens the file, Esc drops to Normal mode.
 //!   * **Normal**: `j`/`k` (and arrows) move, `g`/`G` jump, `i` or `/` returns to
 //!     Insert, `q`/Esc quits, Enter opens the file.
+//!
+//! The screen is repainted only when something changed, so an open but idle
+//! deepsearch costs nothing.
 
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -29,6 +35,7 @@ use ratatui_image::StatefulImage;
 
 use deepsearch_core::{DeepSearch, QueryOptions, SearchResult};
 
+use crate::input::LineInput;
 use crate::open::{candidates_for, AppKind, OpenApp};
 use crate::preview::{Preview, PreviewRequest, PreviewWorker};
 
@@ -108,6 +115,23 @@ fn pretty_dir(path: &std::path::Path) -> String {
     s.into_owned()
 }
 
+/// Enter the alternate screen, with bracketed paste turned on.
+///
+/// Pasting into a search box is an everyday move — a path from another window, a phrase from a
+/// document. Without bracketed paste the terminal delivers it as a burst of individual keystrokes,
+/// which the debounce then turns into a stutter of half-typed searches.
+fn init_terminal() -> DefaultTerminal {
+    let terminal = ratatui::init();
+    let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
+    terminal
+}
+
+/// Hand the terminal back exactly as it was found.
+fn restore_terminal() {
+    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
+    ratatui::restore();
+}
+
 /// How long the query must be idle before we run the search.
 const DEBOUNCE: Duration = Duration::from_millis(120);
 /// Event-poll tick; also the max UI latency for applying a finished preview.
@@ -153,9 +177,12 @@ pub struct App {
     opts: QueryOptions,
 
     mode: Mode,
-    input: String,
+    input: LineInput,
     results: Vec<SearchResult>,
     list_state: ListState,
+    /// Rows visible in the results pane, captured while rendering so PageUp and PageDown move by
+    /// a screenful of *this* terminal rather than a hardcoded guess.
+    list_height: u16,
 
     worker: PreviewWorker,
     generation: u64,
@@ -203,9 +230,10 @@ impl App {
             ds,
             opts,
             mode: Mode::Insert,
-            input: String::new(),
+            input: LineInput::new(),
             results: Vec::new(),
             list_state: ListState::default(),
+            list_height: 10,
             worker: PreviewWorker::spawn(),
             generation: 0,
             preview: Preview::Loading,
@@ -229,35 +257,54 @@ impl App {
 
     /// Run the UI to completion.
     pub fn run(mut self) -> Result<()> {
-        let mut terminal = ratatui::init();
+        let mut terminal = init_terminal();
         let res = self.event_loop(&mut terminal);
-        ratatui::restore();
+        restore_terminal();
         res
     }
 
+    /// The main loop.
+    ///
+    /// Drawing happens only when something actually changed. Polling for input is a blocking wait
+    /// that costs nothing, but redrawing on every tick means waking the CPU 25 times a second to
+    /// paint an identical screen — for a tool that sits open in a terminal all day, that is real
+    /// battery for no benefit. Every branch that changes what is on screen says so explicitly,
+    /// including terminal resizes, which the old unconditional redraw was quietly covering up.
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let mut needs_redraw = true;
         loop {
-            terminal.draw(|f| self.render(f))?;
-            self.drain_previews();
-            self.drain_ai();
+            if needs_redraw {
+                terminal.draw(|f| self.render(f))?;
+                needs_redraw = false;
+            }
+
+            needs_redraw |= self.drain_previews();
+            needs_redraw |= self.drain_ai();
 
             if event::poll(TICK)? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        needs_redraw = true;
+                        match self.handle_key(key.code, key.modifiers) {
+                            Action::Quit => break,
+                            Action::SmartOpen => self.smart_open(terminal)?,
+                            Action::OpenWith(app) => self.launch_app(terminal, app)?,
+                            Action::None => {}
+                        }
                     }
-                    match self.handle_key(key.code, key.modifiers) {
-                        Action::Quit => break,
-                        Action::SmartOpen => self.smart_open(terminal)?,
-                        Action::OpenWith(app) => self.launch_app(terminal, app)?,
-                        Action::None => {}
+                    Event::Paste(text) => {
+                        needs_redraw = true;
+                        self.paste(&text);
                     }
+                    Event::Resize(..) => needs_redraw = true,
+                    _ => {}
                 }
             }
 
             if self.dirty && self.last_edit.elapsed() >= DEBOUNCE {
                 self.run_search();
                 self.dirty = false;
+                needs_redraw = true;
             }
         }
         Ok(())
@@ -266,7 +313,13 @@ impl App {
     // --- input handling ---------------------------------------------------
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Action {
-        // Overlays capture keys while they are up.
+        // Ctrl-c comes first and is never swallowed. An overlay that can trap the one key every
+        // terminal user reaches for to get out is a trap, not a dialog.
+        if mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
+            return Action::Quit;
+        }
+
+        // Overlays capture the remaining keys while they are up.
         if self.show_help {
             // Any key dismisses the help overlay.
             self.show_help = false;
@@ -285,18 +338,12 @@ impl App {
         // Global bindings first.
         if mods.contains(KeyModifiers::CONTROL) {
             match code {
-                KeyCode::Char('c') => return Action::Quit,
                 KeyCode::Char('n') => {
                     self.move_selection(1);
                     return Action::None;
                 }
                 KeyCode::Char('p') => {
                     self.move_selection(-1);
-                    return Action::None;
-                }
-                KeyCode::Char('u') => {
-                    self.input.clear();
-                    self.mark_dirty();
                     return Action::None;
                 }
                 KeyCode::Char('o') => {
@@ -311,15 +358,30 @@ impl App {
                     self.ask_ai();
                     return Action::None;
                 }
+                // Readline habits, available from either mode.
+                KeyCode::Char('u') => return self.edit(|input| input.clear()),
+                KeyCode::Char('w') => return self.edit(LineInput::delete_word_back),
+                KeyCode::Char('k') if self.mode == Mode::Insert => {
+                    return self.edit(LineInput::kill_to_end);
+                }
+                KeyCode::Char('h') if self.mode == Mode::Insert => {
+                    return self.edit(LineInput::backspace);
+                }
                 _ => {}
             }
         }
 
+        // Alt-Backspace also deletes a word, which is what most terminals send.
+        if mods.contains(KeyModifiers::ALT) && code == KeyCode::Backspace {
+            return self.edit(LineInput::delete_word_back);
+        }
+
+        let page = isize::from(self.list_height.max(1) as i16);
         match code {
             KeyCode::Down => self.move_selection(1),
             KeyCode::Up => self.move_selection(-1),
-            KeyCode::PageDown => self.move_selection(10),
-            KeyCode::PageUp => self.move_selection(-10),
+            KeyCode::PageDown => self.move_selection(page),
+            KeyCode::PageUp => self.move_selection(-page),
             KeyCode::Enter => {
                 if self.selected().is_some() {
                     return Action::SmartOpen;
@@ -333,16 +395,38 @@ impl App {
         Action::None
     }
 
+    /// Insert pasted text at the caret.
+    ///
+    /// Newlines and tabs collapse to single spaces: a query is one line, and a multi-line paste
+    /// should search for those words rather than mangle the box.
+    fn paste(&mut self, text: &str) {
+        let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if self.mode == Mode::Normal {
+            self.mode = Mode::Insert;
+        }
+        self.edit(|input| input.insert_str(&flattened));
+    }
+
+    /// Apply an edit to the query, re-running the search only if the text actually changed.
+    ///
+    /// Moving the caret must not restart the search: it would throw away results and make the
+    /// list flicker for a keystroke that asked for nothing new.
+    fn edit(&mut self, op: impl FnOnce(&mut LineInput) -> bool) -> Action {
+        if op(&mut self.input) {
+            self.mark_dirty();
+        }
+        Action::None
+    }
+
     fn handle_insert(&mut self, code: KeyCode) -> Action {
         match code {
-            KeyCode::Char(c) => {
-                self.input.push(c);
-                self.mark_dirty();
-            }
-            KeyCode::Backspace => {
-                self.input.pop();
-                self.mark_dirty();
-            }
+            KeyCode::Char(c) => return self.edit(|input| input.insert(c)),
+            KeyCode::Backspace => return self.edit(LineInput::backspace),
+            KeyCode::Delete => return self.edit(LineInput::delete),
+            KeyCode::Left => self.input.left(),
+            KeyCode::Right => self.input.right(),
+            KeyCode::Home => self.input.home(),
+            KeyCode::End => self.input.end(),
             KeyCode::Esc => self.mode = Mode::Normal,
             _ => {}
         }
@@ -433,7 +517,7 @@ impl App {
         if self.ai_rx.is_some() {
             return; // a request is already in flight
         }
-        let request = self.input.trim().to_string();
+        let request = self.input.text().trim().to_string();
         if request.is_empty() {
             self.status = "type what you're looking for, then Ctrl-a".to_string();
             return;
@@ -448,12 +532,17 @@ impl App {
 
     /// Apply a finished AI translation: replace the query and search, or report
     /// the error.
-    fn drain_ai(&mut self) {
+    ///
+    /// Returns whether anything on screen changed, so the loop knows to repaint.
+    fn drain_ai(&mut self) -> bool {
+        let mut changed = false;
+
         // Pick up the one-shot Ollama availability probe.
         if let Some(probe) = self.ai_probe.as_ref() {
             if let Ok(available) = probe.try_recv() {
                 self.ai_available = available;
                 self.ai_probe = None;
+                changed = true;
             }
         }
 
@@ -461,32 +550,34 @@ impl App {
         if let Some(rx) = self.embed_rx.as_ref() {
             if let Ok((gen, vec)) = rx.try_recv() {
                 self.embed_rx = None;
-                if gen == self.embed_gen && !self.input.trim().is_empty() {
+                changed = true;
+                if gen == self.embed_gen && !self.input.text().trim().is_empty() {
                     self.apply_semantic(&vec);
                 }
             }
         }
 
         let Some(rx) = self.ai_rx.as_ref() else {
-            return;
+            return changed;
         };
         match rx.try_recv() {
             Ok(Ok(query)) => {
                 self.ai_rx = None;
-                self.input = query;
-                self.status = format!("AI → {}", self.input);
+                self.input.set(query);
+                self.status = format!("AI → {}", self.input.text());
                 self.mark_dirty();
             }
             Ok(Err(e)) => {
                 self.ai_rx = None;
                 self.status = format!("AI: {e}");
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {} // still working
+            Err(std::sync::mpsc::TryRecvError::Empty) => return changed, // still working
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.ai_rx = None;
                 self.status = "AI request failed".to_string();
             }
         }
+        true
     }
 
     fn mark_dirty(&mut self) {
@@ -497,7 +588,7 @@ impl App {
     // --- search & selection ----------------------------------------------
 
     fn run_search(&mut self) {
-        if self.input.trim().is_empty() {
+        if self.input.text().trim().is_empty() {
             self.results.clear();
             self.list_state.select(None);
             self.preview = Preview::Loading;
@@ -506,7 +597,7 @@ impl App {
             return;
         }
         let start = Instant::now();
-        self.results = self.ds.search(&self.input, &self.opts);
+        self.results = self.ds.search(self.input.text(), &self.opts);
         let elapsed = start.elapsed();
         self.status = format!(
             "{} results in {:.1} ms",
@@ -534,7 +625,7 @@ impl App {
         if !self.has_embeddings || !self.ai_available {
             return;
         }
-        let query = self.input.trim().to_string();
+        let query = self.input.text().trim().to_string();
         if query.is_empty() {
             return;
         }
@@ -554,9 +645,12 @@ impl App {
     /// when possible.
     fn apply_semantic(&mut self, query_vec: &[f32]) {
         let keep = self.selected().map(|r| r.doc_id);
-        self.results =
-            self.ds
-                .hybrid_search(&self.input, query_vec, &self.opts, crate::SEMANTIC_WEIGHT);
+        self.results = self.ds.hybrid_search(
+            self.input.text(),
+            query_vec,
+            &self.opts,
+            crate::SEMANTIC_WEIGHT,
+        );
         if self.results.is_empty() {
             self.list_state.select(None);
             self.preview = Preview::Loading;
@@ -600,6 +694,7 @@ impl App {
     /// Query terms for match highlighting: raw, lowercased, length >= 2.
     fn highlight_terms(&self) -> Vec<String> {
         self.input
+            .text()
             .split_whitespace()
             .map(|w| w.to_lowercase())
             .filter(|w| w.chars().count() >= 2)
@@ -623,11 +718,15 @@ impl App {
     }
 
     /// Apply any preview replies whose generation is still current.
-    fn drain_previews(&mut self) {
+    ///
+    /// Returns whether anything on screen changed, so the loop knows to repaint.
+    fn drain_previews(&mut self) -> bool {
+        let mut changed = false;
         while let Ok((gen, preview)) = self.worker.rx.try_recv() {
             if gen != self.generation {
                 continue; // stale
             }
+            changed = true;
             match preview {
                 Preview::Image(img) => match self.ensure_picker() {
                     Some(picker) => {
@@ -646,6 +745,7 @@ impl App {
                 }
             }
         }
+        changed
     }
 
     /// Lazily initialize the image picker, probing the terminal for its
@@ -667,9 +767,9 @@ impl App {
         };
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
 
-        ratatui::restore();
+        restore_terminal();
         let status = std::process::Command::new(&editor).arg(&path).status();
-        *terminal = ratatui::init();
+        *terminal = init_terminal();
         terminal.clear()?;
 
         if let Err(e) = status {
@@ -714,11 +814,11 @@ impl App {
     /// are spawned detached so the UI keeps running.
     fn launch_app(&mut self, terminal: &mut DefaultTerminal, app: OpenApp) -> Result<()> {
         if app.terminal {
-            ratatui::restore();
+            restore_terminal();
             let status = std::process::Command::new(&app.program)
                 .args(&app.args)
                 .status();
-            *terminal = ratatui::init();
+            *terminal = init_terminal();
             terminal.clear()?;
             self.status = match status {
                 Ok(_) => format!("opened in {}", app.label),
@@ -872,26 +972,69 @@ impl App {
         title.push(Span::raw(" "));
 
         let focused = self.mode == Mode::Insert;
-        let text = Line::from(vec![
-            Span::styled(
-                "❯ ",
-                Style::default()
-                    .fg(theme::ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(&self.input, theme::body()),
-        ]);
-        frame.render_widget(
-            Paragraph::new(text).block(panel(Line::from(title), focused)),
-            area,
-        );
+        let block = panel(Line::from(title), focused);
+        // Room left for the query itself, once the borders, the padding and the "❯ " prompt are
+        // paid for. The input scrolls inside whatever is left rather than running off the edge.
+        let inner_width = block.inner(area).width;
+        let prompt_width = 2u16;
+        let room = inner_width.saturating_sub(prompt_width) as usize;
+        let view = self.input.view(room);
+
+        let mut spans = vec![Span::styled(
+            "❯ ",
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )];
+        if view.scrolled {
+            // Tell the user the query continues off-screen to the left; without this a scrolled
+            // box looks like it simply lost what they typed.
+            spans.push(Span::styled("‹", theme::dim()));
+            spans.push(Span::styled(
+                view.text.chars().skip(1).collect::<String>(),
+                theme::body(),
+            ));
+        } else if self.input.is_empty() {
+            spans.push(Span::styled("search your files…", theme::dim()));
+        } else {
+            spans.push(Span::styled(view.text.clone(), theme::body()));
+        }
+
+        frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
 
         if self.mode == Mode::Insert && area.width > 2 {
-            // Place the cursor right after the prompt + current input, clamped
-            // inside the box (saturating math guards against tiny terminals).
+            // The caret sits where the view says it does, clamped inside the box so a tiny
+            // terminal can never push it onto the border.
             let max_x = area.right().saturating_sub(2);
-            let x = (area.x + 4 + self.input.chars().count() as u16).min(max_x);
+            let x = (area.x + 2 + prompt_width + view.cursor_col as u16).min(max_x);
             frame.set_cursor_position(Position::new(x, area.y + 1));
+        }
+    }
+
+    /// What to show in the results pane when there is nothing to list.
+    ///
+    /// A pane that is merely blank makes the user wonder whether the tool is broken, still
+    /// working, or simply found nothing. Say which.
+    fn empty_results_message(&self) -> Vec<Line<'static>> {
+        let hint = |text: &str| Line::from(Span::styled(text.to_string(), theme::dim()));
+        if self.input.text().trim().is_empty() {
+            vec![
+                Line::from(Span::styled(
+                    format!("{} documents indexed", self.ds.len()),
+                    theme::body(),
+                )),
+                Line::from(""),
+                hint("Start typing to search."),
+                hint("Narrow it down with ext:rs or type:pdf."),
+            ]
+        } else {
+            vec![
+                Line::from(Span::styled("No matches.", theme::body())),
+                Line::from(""),
+                hint("Try fewer or more general words."),
+                hint("Filters like ext:md and type:image also apply."),
+                hint("Ctrl-u clears the query."),
+            ]
         }
     }
 
@@ -921,8 +1064,23 @@ impl App {
             Span::styled(format!("{} ", self.results.len()), theme::dim()),
         ]);
         let focused = self.mode == Mode::Normal;
+        let block = panel(title, focused);
+
+        // Remember the viewport so PageUp/PageDown move by an actual screenful.
+        self.list_height = block.inner(area).height;
+
+        if self.results.is_empty() {
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            frame.render_widget(
+                Paragraph::new(self.empty_results_message()).wrap(Wrap { trim: false }),
+                inner,
+            );
+            return;
+        }
+
         let list = List::new(items)
-            .block(panel(title, focused))
+            .block(block)
             .highlight_style(theme::selected())
             .highlight_symbol("▌ ");
         frame.render_stateful_widget(list, area, &mut self.list_state);
@@ -961,9 +1119,24 @@ impl App {
             }
         }
 
+        // With nothing selected there is nothing to load, and a permanent "…" reads as a preview
+        // that never arrives. Say what the pane is waiting for instead.
+        if self.selected().is_none() {
+            let message = if self.results.is_empty() && !self.input.text().trim().is_empty() {
+                "Nothing to preview — no result matched."
+            } else {
+                "Select a result to preview it here."
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(message, theme::dim()))),
+                inner,
+            );
+            return;
+        }
+
         let text: Text = match &self.preview {
             Preview::Text(t) | Preview::Meta(t) => t.clone(),
-            Preview::Loading => Text::from(Line::from(Span::styled("…", theme::dim()))),
+            Preview::Loading => Text::from(Line::from(Span::styled("loading…", theme::dim()))),
             Preview::Error(e) => Text::from(Line::from(Span::styled(
                 e.clone(),
                 Style::default().fg(theme::ERR),
@@ -1029,13 +1202,22 @@ fn render_help(frame: &mut Frame) {
     let rows: &[(&str, &str)] = &[
         ("type", "edit the query (filters as you type)"),
         ("ext:rs / type:pdf", "filter results by extension or type"),
+        ("← / →  ·  Home / End", "move the caret in the query"),
+        (
+            "Ctrl-w  ·  Alt-Backspace",
+            "delete the word behind the caret",
+        ),
+        (
+            "Ctrl-k  ·  Delete",
+            "delete to end of query · delete forwards",
+        ),
+        ("Ctrl-u", "clear the query"),
         ("↑ / ↓  ·  Ctrl-n / Ctrl-p", "move selection"),
-        ("PageUp / PageDown", "move by 10"),
+        ("PageUp / PageDown", "move by one screenful"),
         ("Enter", "open in the right app for the file"),
         ("o  ·  Ctrl-o", "open-with menu (choose an app)"),
         ("Ctrl-a", "ask in plain language (local Ollama)"),
         ("y  ·  Ctrl-y", "copy the file path to the clipboard"),
-        ("Ctrl-u", "clear the query"),
         ("Esc", "Insert → Normal mode"),
         ("i  ·  /", "Normal → Insert mode"),
         ("j / k  ·  g / G", "move / jump (Normal mode)"),
@@ -1142,9 +1324,24 @@ mod tests {
             });
         }
         let mut app = App::new(DeepSearch::new(idx), QueryOptions::default());
-        app.input = "notes".to_string();
+        app.input.set("notes");
         app.run_search();
         app
+    }
+
+    /// Feed a key to the app the way the event loop would.
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(code, KeyModifiers::NONE);
+    }
+
+    fn ctrl(app: &mut App, c: char) -> Action {
+        app.handle_key(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn type_str(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
     }
 
     /// Render the UI into an off-screen buffer and return it as plain text, so
@@ -1215,6 +1412,184 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_query_box_edits_at_the_caret_not_only_at_the_end() {
+        let mut app = demo_app();
+        app.input.set("meting notes");
+        // Walk back to just after "me" and repair the typo in place.
+        app.input.home();
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Right);
+        }
+        type_str(&mut app, "e");
+        assert_eq!(app.input.text(), "meeting notes");
+    }
+
+    #[test]
+    fn ctrl_w_deletes_a_word_and_ctrl_u_clears_the_query() {
+        let mut app = demo_app();
+        app.input.set("annual report draft");
+        ctrl(&mut app, 'w');
+        assert_eq!(app.input.text(), "annual report ");
+        ctrl(&mut app, 'u');
+        assert_eq!(app.input.text(), "");
+    }
+
+    #[test]
+    fn moving_the_caret_does_not_restart_the_search() {
+        let mut app = demo_app();
+        app.dirty = false;
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::End);
+        assert!(
+            !app.dirty,
+            "caret movement changes no text, so it must not queue another search"
+        );
+
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.dirty, "typing must queue a search");
+    }
+
+    #[test]
+    fn deleting_nothing_does_not_queue_a_search() {
+        let mut app = demo_app();
+        app.input.clear();
+        app.dirty = false;
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Delete);
+        ctrl(&mut app, 'w');
+        assert!(!app.dirty, "no-op edits must not trigger work");
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_with_an_overlay_open() {
+        let mut app = demo_app();
+        app.show_help = true;
+        assert!(
+            matches!(ctrl(&mut app, 'c'), Action::Quit),
+            "help must not trap Ctrl-c"
+        );
+
+        let mut app = demo_app();
+        app.toggle_open_menu();
+        assert!(
+            matches!(ctrl(&mut app, 'c'), Action::Quit),
+            "the menu must not trap Ctrl-c"
+        );
+    }
+
+    #[test]
+    fn page_keys_move_by_the_visible_height_not_a_fixed_guess() {
+        let mut app = demo_app();
+        // Rendering is what teaches the app how tall the list pane is.
+        render_to_text(&mut app, 100, 40);
+        let tall = app.list_height;
+        render_to_text(&mut app, 100, 10);
+        let short = app.list_height;
+        assert!(
+            tall > short,
+            "the page size must follow the terminal ({tall} vs {short})"
+        );
+        assert!(
+            short >= 1,
+            "even a cramped pane must page by at least one row"
+        );
+    }
+
+    #[test]
+    fn a_long_query_scrolls_instead_of_running_off_the_box() {
+        let mut app = demo_app();
+        app.input.set("x".repeat(300));
+        let out = render_to_text(&mut app, 60, 12);
+        let query_row = out.lines().nth(1).unwrap_or_default();
+        assert!(
+            query_row.chars().count() <= 60,
+            "the query must stay inside the terminal: {query_row:?}"
+        );
+        assert!(
+            query_row.contains('\u{2039}'),
+            "a scrolled query must show the ‹ marker"
+        );
+    }
+
+    #[test]
+    fn an_empty_result_set_explains_itself() {
+        let mut app = demo_app();
+        app.input.set("zzzznothingmatchesthis");
+        app.run_search();
+        let out = render_to_text(&mut app, 100, 16);
+        assert!(app.results.is_empty(), "the fixture should match nothing");
+        assert!(
+            out.contains("No matches"),
+            "the results pane must say so: {out}"
+        );
+        assert!(
+            out.contains("ext:"),
+            "and point at the filters that might help"
+        );
+        assert!(
+            out.contains("Nothing to preview"),
+            "the preview pane must not sit on a bare ellipsis"
+        );
+    }
+
+    #[test]
+    fn an_untouched_query_invites_the_user_in() {
+        let mut app = demo_app();
+        app.input.clear();
+        app.run_search();
+        let out = render_to_text(&mut app, 100, 16);
+        assert!(
+            out.contains("documents indexed"),
+            "say what is searchable: {out}"
+        );
+        assert!(out.contains("Start typing"), "and what to do about it");
+    }
+
+    #[test]
+    fn a_pasted_multi_line_selection_becomes_one_query() {
+        let mut app = demo_app();
+        app.input.clear();
+        app.mode = Mode::Normal;
+        app.paste("annual\n report\t draft\n");
+        assert_eq!(app.input.text(), "annual report draft");
+        assert!(
+            app.mode == Mode::Insert,
+            "pasting should put you back in the query"
+        );
+    }
+
+    #[test]
+    fn tiny_terminals_render_without_panicking() {
+        // A pane can end up with zero usable width; every layout calculation has to survive it.
+        for (w, h) in [(1u16, 1u16), (3, 2), (8, 4), (20, 6), (40, 10)] {
+            let mut app = demo_app();
+            app.show_help = true;
+            render_to_text(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn a_query_of_wide_characters_keeps_the_caret_inside_the_box() {
+        // Each of these occupies two columns. Counting characters instead of cells would put the
+        // caret roughly twice as far right as the text actually reaches — off the border, and in
+        // a narrow terminal off the screen entirely.
+        let mut app = demo_app();
+        app.input.set("日本語のテキストをたくさん入力する");
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        let caret = terminal.get_cursor_position().unwrap();
+        assert_eq!(caret.y, 1, "the caret belongs on the query line");
+        assert!(
+            caret.x < 39,
+            "the caret escaped the query box at x={}",
+            caret.x
+        );
     }
 
     #[test]

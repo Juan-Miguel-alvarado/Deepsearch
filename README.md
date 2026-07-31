@@ -117,6 +117,172 @@ opens the UI.
 
 ---
 
+## Usage
+
+```
+deepsearch index [PATH]            Build the index (PATH defaults to $HOME).
+deepsearch index [PATH] --incremental
+                                   Reindex only changed files; drop deleted ones.
+deepsearch index [PATH] --semantic Also build semantic embeddings (see below).
+deepsearch query "<words>"         Ranked results (name + content).
+        --limit N                  Cap results (default 20).
+        --keyword                  Force keyword-only (skip semantic).
+        --json                     Machine-readable output.
+deepsearch ask "<plain text>"      Natural-language search (needs local Ollama).
+deepsearch tui [PATH]              Interactive UI (indexes PATH first if empty).
+deepsearch stats                   Index size, term counts, tombstone ratio.
+        --cache <FILE>             Use a non-default index location (global flag).
+```
+
+### Ask questions about your files (optional, local & free)
+
+With [Ollama](https://ollama.com) running locally, `ask` doesn't just find files
+— it **answers**, from what's actually inside them, and cites the sources:
+
+```bash
+deepsearch ask "how are passwords handled in my projects?"
+```
+```
+reading 3 file(s)…
+
+The password is typed as a text input, but it can be switched to display the
+password by clicking a button. The password itself is not stored anywhere in
+this excerpt. [3]
+
+Sources:
+  [1] ~/development/flutter/docs/.../Gradle-for-Android.md
+  [2] ~/Documents/proyects/.../ChangePasswordForm.tsx
+  [3] ~/Documents/proyects/.../password-input.tsx
+```
+
+It's retrieval-augmented generation over your own index: the question finds the
+most relevant documents (semantically when embeddings exist), deepsearch pulls
+the **passage that bears on the question** out of each one — not the file's
+imports — and a local model answers from those excerpts only, saying so plainly
+when they don't contain the answer. Nothing leaves the machine.
+
+`--json` emits `{ "answer": ..., "sources": [...] }` for scripting.
+
+**Speed.** This is the one slow feature: on a CPU-only machine expect roughly a
+minute per question (context length dominates, which is why only a few short
+excerpts are sent). A smaller model is markedly faster:
+
+```bash
+ollama pull llama3.2:1b
+export DEEPSEARCH_OLLAMA_MODEL=llama3.2:1b
+```
+
+It's entirely optional: with no Ollama installed, `ask` prints a friendly hint
+and everything else works exactly the same. deepsearch picks a locally installed
+model that can generate text (or set `DEEPSEARCH_OLLAMA_MODEL`); point at a
+non-default server with `OLLAMA_HOST`.
+
+### Semantic search (search by meaning)
+
+Keyword search only finds the words you type. **Semantic search** finds files by
+*meaning*, so a search for `login` surfaces a document about "authentication,
+credentials and session tokens" even though it never contains the word "login".
+
+Build it once (needs a local embedding model — free, offline):
+
+```bash
+ollama pull nomic-embed-text
+deepsearch index --semantic          # embeds every document (a one-time pass)
+```
+
+After that it just works:
+
+- `deepsearch query "login"` automatically blends keyword + semantic ranking
+  (add `--keyword` to force the old behaviour).
+- In the **TUI**, keyword results appear instantly and are re-ranked by meaning a
+  moment later; a green **`semantic`** tag in the search box shows it's active.
+
+How it works: each document is embedded into a vector with the local model; a
+query is embedded the same way and scored by cosine similarity, then blended with
+BM25 (`(1 − w)·keyword + w·semantic`, `w = 0.5`). Everything runs locally through
+Ollama — nothing leaves the machine. Pick a different embedding model with
+`DEEPSEARCH_OLLAMA_EMBED_MODEL`.
+
+> **Note:** enabling embeddings bumps the on-disk index format. After upgrading,
+> run `deepsearch index` again to rebuild the cache.
+
+### Search filters
+
+Any query — from the shell or in the TUI — can carry inline filters that narrow
+results by file type or extension. They combine with search terms, and a filter
+on its own browses the corpus (newest first):
+
+| Filter | Matches |
+|--------|---------|
+| `type:image` (`img`) | images |
+| `type:pdf` | PDFs |
+| `type:code` / `type:text` | source / plain text |
+| `type:docx` (`doc`) | Word documents |
+| `type:binary` (`bin`) | other binaries |
+| `type:dir` (`folder`) | **folders** |
+| `ext:rs`, `ext:.md` | files with that extension (dot optional) |
+
+```
+deepsearch query "parser ext:rs"     # 'parser' in .rs files only
+deepsearch query "invoice type:pdf"  # 'invoice' among PDFs
+deepsearch query "type:image"        # every image, most recent first
+deepsearch query "invoices type:dir"  # find the folder, not the files in it
+```
+
+### TUI keys
+
+**Editing the query** — the box is a proper line editor, with the keys your shell
+already gave you:
+
+| Key | Action |
+|-----|--------|
+| type | edit the query (incremental, debounced) |
+| `←`/`→`, `Home`/`End` | move the caret inside the query |
+| `Backspace` / `Delete` | delete behind / under the caret |
+| `Ctrl-w`, `Alt-Backspace` | delete the word behind the caret |
+| `Ctrl-k` | delete from the caret to the end |
+| `Ctrl-u` | clear the query |
+| paste | lands at the caret; newlines collapse to spaces |
+
+**Moving and opening:**
+
+| Key | Action |
+|-----|--------|
+| `↑`/`↓`, `Ctrl-n`/`Ctrl-p` | move selection |
+| `PageUp`/`PageDown` | move by one screenful of *your* terminal |
+| `Esc` | switch to Normal mode |
+| `j`/`k`, `g`/`G` | move / jump (Normal mode) |
+| `i` or `/` | back to Insert mode |
+| `Enter` | **open** the file in the right app for its type (see below) |
+| `o` (Normal) / `Ctrl-o` | **open with…** — a clean, numbered menu of installed apps |
+| `Ctrl-a` | **ask AI** — rewrite the query in plain language (needs local Ollama) |
+| `y` (Normal) / `Ctrl-y` | **copy** the selected file's path to the clipboard |
+| `F1` (any mode) / `?` (Normal) | show a **help overlay** listing every key |
+| `q` / `Esc` (Normal), `Ctrl-c` | quit |
+
+Two modes exist so the vim keys (`j`/`k`) can coexist with typing letters into the
+query box. Press `F1` any time (or `?` in Normal mode) for the full key list.
+`Ctrl-c` quits from anywhere, including with an overlay up.
+
+A query longer than the box scrolls sideways with the caret and marks the hidden
+text with `‹`, so what you typed never silently runs off the edge.
+
+**Smart open (`Enter`).** Opening does the sensible thing for the file type:
+text and source open in your `$EDITOR`, but an image opens in an image viewer, a
+PDF in a PDF reader, a video in a media player, and a Word doc / other file in
+the OS default handler — so you never get an image dumped as garbled text in the
+editor again.
+
+**Open-with menu (`o`).** A tidy popup that detects the applications actually
+installed on your `PATH` and orders them by relevance to the selected file
+(image viewers for an image, PDF readers for a PDF, …), then the OS default
+handler, then **Reveal in folder** and **Terminal here**. Press the number next
+to an entry to launch it instantly, or move with `↑`/`↓` and press `Enter`.
+Terminal apps (vim, helix, …) suspend the UI while they run; GUI apps launch
+detached so the search stays open.
+
+---
+
 ## Architecture
 
 Three layers, with a hard boundary between the engine and the UI:
@@ -254,6 +420,50 @@ show metadata. **Image decoding also happens on the worker** (decoded and
 downscaled there); the UI thread only wraps the result in the terminal-graphics
 widget.
 
+### The query box is a real line editor, and it lives outside the UI
+
+A search box you can only append to is the kind of thing you stop noticing and
+start resenting: spot a typo four words back and your only move is to delete the
+rest of the query. So the caret moves, `Ctrl-w` eats a word, paste lands where the
+caret is.
+
+The logic sits in its own module (`crates/cli/src/input.rs`) with no terminal and
+no ratatui in sight — it is pure functions over a string and a caret position.
+That is where an input box actually goes wrong: stepping over a multi-byte
+character, deleting a word at the start of the line, keeping the caret visible in a
+query longer than the box. Isolated, each of those is a three-line test instead of
+a manual poke at a running UI.
+
+Two distinctions are load-bearing. Positions are **character** indices, never byte
+offsets, so `año` is three steps and backspace never splits a character in half.
+Widths are measured in **terminal cells**, so a CJK character that occupies two
+columns is counted as two — otherwise the caret drifts to roughly twice the text's
+real width and lands on the border. Horizontal scrolling is *derived* from the
+caret rather than remembered, so it cannot fall out of sync with the text after an
+edit; a `‹` marks content hidden to the left, because a box that silently truncates
+looks like a box that lost your query.
+
+### The UI is idle when you are
+
+The screen is repainted only when something actually changed — a key, a finished
+preview, an AI reply, a terminal resize. Waiting for input is a blocking poll that
+costs nothing; repainting on every tick meant waking the CPU 25 times a second to
+draw an identical screen. For a tool that sits open in a terminal all day that is
+real battery for no benefit.
+
+The cost of doing this is that every state change must now *say* it changed —
+including terminal resizes, which the old unconditional redraw was quietly
+papering over. Each background channel therefore reports whether it applied
+anything, rather than the loop assuming the worst.
+
+### Empty panes have to say why they are empty
+
+A blank pane is ambiguous: no results, still working, or broken? All three look
+identical. So the results pane explains itself — before you type it says how many
+documents are indexed and points at the `ext:` and `type:` filters; with no
+matches it says so and suggests what to try. The preview pane says what it is
+waiting for instead of showing an ellipsis that never resolves.
+
 ### Images: native protocols, no system dependency
 `ratatui-image` renders via Kitty / Sixel / iTerm2 when the terminal supports
 them, falling back to **Unicode half-blocks** everywhere else. Its default
@@ -294,153 +504,6 @@ so few, short, relevant excerpts beat many long ones.
 extraction — `pdf-extract` in particular, which can *panic* on malformed PDFs —
 is isolated behind `catch_unwind` **per file**. A corrupt document is counted as
 an error and skipped; the index build continues.
-
----
-
-## Usage
-
-```
-deepsearch index [PATH]            Build the index (PATH defaults to $HOME).
-deepsearch index [PATH] --incremental
-                                   Reindex only changed files; drop deleted ones.
-deepsearch index [PATH] --semantic Also build semantic embeddings (see below).
-deepsearch query "<words>"         Ranked results (name + content).
-        --limit N                  Cap results (default 20).
-        --keyword                  Force keyword-only (skip semantic).
-        --json                     Machine-readable output.
-deepsearch ask "<plain text>"      Natural-language search (needs local Ollama).
-deepsearch tui [PATH]              Interactive UI (indexes PATH first if empty).
-deepsearch stats                   Index size, term counts, tombstone ratio.
-        --cache <FILE>             Use a non-default index location (global flag).
-```
-
-### Ask questions about your files (optional, local & free)
-
-With [Ollama](https://ollama.com) running locally, `ask` doesn't just find files
-— it **answers**, from what's actually inside them, and cites the sources:
-
-```bash
-deepsearch ask "how are passwords handled in my projects?"
-```
-```
-reading 3 file(s)…
-
-The password is typed as a text input, but it can be switched to display the
-password by clicking a button. The password itself is not stored anywhere in
-this excerpt. [3]
-
-Sources:
-  [1] ~/development/flutter/docs/.../Gradle-for-Android.md
-  [2] ~/Documents/proyects/.../ChangePasswordForm.tsx
-  [3] ~/Documents/proyects/.../password-input.tsx
-```
-
-It's retrieval-augmented generation over your own index: the question finds the
-most relevant documents (semantically when embeddings exist), deepsearch pulls
-the **passage that bears on the question** out of each one — not the file's
-imports — and a local model answers from those excerpts only, saying so plainly
-when they don't contain the answer. Nothing leaves the machine.
-
-`--json` emits `{ "answer": ..., "sources": [...] }` for scripting.
-
-**Speed.** This is the one slow feature: on a CPU-only machine expect roughly a
-minute per question (context length dominates, which is why only a few short
-excerpts are sent). A smaller model is markedly faster:
-
-```bash
-ollama pull llama3.2:1b
-export DEEPSEARCH_OLLAMA_MODEL=llama3.2:1b
-```
-
-It's entirely optional: with no Ollama installed, `ask` prints a friendly hint
-and everything else works exactly the same. deepsearch picks a locally installed
-model that can generate text (or set `DEEPSEARCH_OLLAMA_MODEL`); point at a
-non-default server with `OLLAMA_HOST`.
-
-### Semantic search (search by meaning)
-
-Keyword search only finds the words you type. **Semantic search** finds files by
-*meaning*, so a search for `login` surfaces a document about "authentication,
-credentials and session tokens" even though it never contains the word "login".
-
-Build it once (needs a local embedding model — free, offline):
-
-```bash
-ollama pull nomic-embed-text
-deepsearch index --semantic          # embeds every document (a one-time pass)
-```
-
-After that it just works:
-
-- `deepsearch query "login"` automatically blends keyword + semantic ranking
-  (add `--keyword` to force the old behaviour).
-- In the **TUI**, keyword results appear instantly and are re-ranked by meaning a
-  moment later; a green **`semantic`** tag in the search box shows it's active.
-
-How it works: each document is embedded into a vector with the local model; a
-query is embedded the same way and scored by cosine similarity, then blended with
-BM25 (`(1 − w)·keyword + w·semantic`, `w = 0.5`). Everything runs locally through
-Ollama — nothing leaves the machine. Pick a different embedding model with
-`DEEPSEARCH_OLLAMA_EMBED_MODEL`.
-
-> **Note:** enabling embeddings bumps the on-disk index format. After upgrading,
-> run `deepsearch index` again to rebuild the cache.
-
-### Search filters
-
-Any query — from the shell or in the TUI — can carry inline filters that narrow
-results by file type or extension. They combine with search terms, and a filter
-on its own browses the corpus (newest first):
-
-| Filter | Matches |
-|--------|---------|
-| `type:image` (`img`) | images |
-| `type:pdf` | PDFs |
-| `type:code` / `type:text` | source / plain text |
-| `type:docx` (`doc`) | Word documents |
-| `type:binary` (`bin`) | other binaries |
-| `type:dir` (`folder`) | **folders** |
-| `ext:rs`, `ext:.md` | files with that extension (dot optional) |
-
-```
-deepsearch query "parser ext:rs"     # 'parser' in .rs files only
-deepsearch query "invoice type:pdf"  # 'invoice' among PDFs
-deepsearch query "type:image"        # every image, most recent first
-deepsearch query "invoices type:dir"  # find the folder, not the files in it
-```
-
-### TUI keys
-| Key | Action |
-|-----|--------|
-| type | edit the query (incremental, debounced) |
-| `↑`/`↓`, `Ctrl-n`/`Ctrl-p` | move selection |
-| `Esc` | switch to Normal mode |
-| `j`/`k`, `g`/`G` | move / jump (Normal mode) |
-| `i` or `/` | back to Insert mode |
-| `Enter` | **open** the file in the right app for its type (see below) |
-| `o` (Normal) / `Ctrl-o` | **open with…** — a clean, numbered menu of installed apps |
-| `Ctrl-a` | **ask AI** — rewrite the query in plain language (needs local Ollama) |
-| `y` (Normal) / `Ctrl-y` | **copy** the selected file's path to the clipboard |
-| `F1` (any mode) / `?` (Normal) | show a **help overlay** listing every key |
-| `Ctrl-U` | clear the query |
-| `q` / `Esc` (Normal), `Ctrl-C` | quit |
-
-Two modes exist so the vim keys (`j`/`k`) can coexist with typing letters into
-the query box. Press `F1` any time (or `?` in Normal mode) for the full key list.
-
-**Smart open (`Enter`).** Opening does the sensible thing for the file type:
-text and source open in your `$EDITOR`, but an image opens in an image viewer, a
-PDF in a PDF reader, a video in a media player, and a Word doc / other file in
-the OS default handler — so you never get an image dumped as garbled text in the
-editor again.
-
-**Open-with menu (`o`).** A tidy popup that detects the applications actually
-installed on your `PATH` and orders them by relevance to the selected file
-(image viewers for an image, PDF readers for a PDF, …), then the OS default
-handler, then **Reveal in folder** and **Terminal here**. Press the number next
-to an entry to launch it instantly, or move with `↑`/`↓` and press `Enter`.
-Terminal apps (vim, helix, …) suspend the UI while they run; GUI apps launch
-detached so the search stays open.
 
 ---
 
@@ -485,8 +548,16 @@ snippet window used for answering, Ollama model selection (an embedding-only
 model must never be chosen for generation), and the preview match-overlay.
 
 The **TUI renders into an off-screen `TestBackend`** and the resulting buffer is
-asserted as text, so the layout, the AI badges and the help overlay can be
-checked — and regressions caught — without a terminal.
+asserted as text, so the layout, the AI badges, the help overlay and the empty
+states can be checked — and regressions caught — without a terminal. Keys are fed
+through the same handler the event loop uses, which is what lets the tests assert
+behaviour rather than appearance: that moving the caret does *not* queue another
+search, that a no-op delete does no work, that `Ctrl-c` is never swallowed by an
+overlay, and that `PageUp` moves by the height the last render actually had.
+
+The line editor is tested on its own, away from any terminal: caret movement,
+word deletion, multi-byte characters, wide characters measured in cells, and a
+query several times longer than its box.
 
 ---
 
